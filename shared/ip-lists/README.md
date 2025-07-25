@@ -32,3 +32,14 @@ wget https://gui.xmr.pm/files/block.txt
 python3 preprocess-monero-block-list.py
 
 ```
+
+## LinkingLion banlist
+
+A banlist of IP addresses for LinkingLion.
+
+```
+162.218.65.0/24
+209.222.252.0/24
+91.198.115.0/24
+2604:d500:4:1::/64
+```
