@@ -66,6 +66,22 @@ function drawWebsockets(id) {
   }
 }
 
+function drawWebsocketError(id, errorMessage) {
+  let picker = document.getElementById(id);
+  picker.style.padding = "1em";
+
+  let heading = document.createElement("h5");
+  heading.textContent = "WebSocket Configuration Error";
+  heading.style.color = "#dc3545"; // Bootstrap danger color
+  picker.appendChild(heading);
+
+  let message = document.createElement("div");
+  message.innerHTML = errorMessage;
+  message.classList.add("alert", "alert-warning");
+  message.style.fontSize = "0.9em";
+  picker.appendChild(message);
+}
+
 /*
  params:
   websocketJsonUrl: the url to the websocket.json file 
@@ -84,15 +100,27 @@ function initWebsocketPicker(
   g_resetCallback = resetCallback;
 
   fetch(websocketJsonReq)
-    .then((response) => response.json())
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      return response.json();
+    })
     .then((data) => {
       console.log("learned about the following websockets:", data);
       websockets = data;
       drawWebsockets(divId);
     })
     .catch((e) => {
-      console.error("could not fetch websockets", e);
-      websockets = {};
-      drawWebsockets(divId);
+      console.error("could not fetch websockets.json", e);
+      const errorMessage = `
+        <strong>Missing websockets.json configuration file</strong><br>
+        The websocket picker could not load the configuration file: <code>websockets.json</code><br><br>
+        <strong>To fix this:</strong><br>
+        1. Create a <code>websockets.json</code> file in the same directory as this HTML page<br>
+        2. See the <a href="https://github.com/0xB10C/peer-observer/tree/master/tools/websocket#websocket-picker-configuration" target="_blank">WebSocket documentation</a> for examples and configuration details<br><br>
+        <strong>Error:</strong> ${e.message}
+      `;
+      drawWebsocketError(divId, errorMessage);
     });
 }
