@@ -34,6 +34,9 @@ pub const LABEL_RPC_CONNECTION_TYPE: &str = "connection_type";
 pub const LABEL_RPC_PROTOCOL_VERSION: &str = "protocol_version";
 pub const LABEL_RPC_ASN: &str = "ASN";
 
+pub const LABEL_PEER_ID: &str = "peer_id";
+pub const LABEL_PEER_ADDR: &str = "peer_addr";
+
 pub const BUCKETS_ADDR_ADDRESS_COUNT: [f64; 30] = [
     0f64, 1f64, 2f64, 3f64, 4f64, 5f64, 6f64, 7f64, 8f64, 9f64, 10f64, 15f64, 20f64, 25f64, 30f64,
     50f64, 75f64, 100f64, 150f64, 200f64, 250f64, 300f64, 400f64, 500f64, 600f64, 700f64, 800f64,
@@ -240,6 +243,9 @@ pub struct Metrics {
     pub rpc_peer_info_ping_mean: Gauge,
     pub rpc_peer_info_minping_median: Gauge,
     pub rpc_peer_info_minping_mean: Gauge,
+    pub tx_unsolicited_by_peer: IntCounterVec,
+    pub tx_unannounced_by_peer: IntCounterVec,
+    pub tx_peer_last_activity: IntGaugeVec,
 }
 
 impl Metrics {
@@ -332,6 +338,9 @@ impl Metrics {
         g!(rpc_peer_info_ping_mean, "Mean ping (in milliseconds) of all connected peers.", registry);
         g!(rpc_peer_info_minping_median, "Median min_ping (in milliseconds) of all connected peers.", registry);
         g!(rpc_peer_info_minping_mean, "Mean min_ping (in milliseconds) of all connected peers.", registry);
+        icv!(tx_unsolicited_by_peer, "Number of unsolicited transactions received per peer", [LABEL_PEER_ID, LABEL_PEER_ADDR], registry);
+        icv!(tx_unannounced_by_peer, "Number of unannounced transaction requests per peer", [LABEL_PEER_ID, LABEL_PEER_ADDR], registry);
+        igv!(tx_peer_last_activity, "Timestamp of last transaction activity per peer", [LABEL_PEER_ID], registry);
 
 
         Self {
@@ -421,6 +430,9 @@ impl Metrics {
             rpc_peer_info_ping_mean,
             rpc_peer_info_minping_median,
             rpc_peer_info_minping_mean,
+            tx_unsolicited_by_peer,
+            tx_unannounced_by_peer,
+            tx_peer_last_activity,
         }
     }
 }
