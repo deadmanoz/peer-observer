@@ -43,22 +43,101 @@ jobs:
           # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4)
           # model: "claude-opus-4-20250514"
           
-          # Optional: Customize the trigger phrase (default: @claude)
-          # trigger_phrase: "/claude"
+          # Allow Claude to run Rust and project-specific commands
+          allowed_tools: |
+            Bash(cargo build)
+            Bash(cargo build --release)
+            Bash(cargo test)
+            Bash(cargo test --features nats_integration_tests)
+            Bash(cargo test -- --nocapture)
+            Bash(cargo clippy)
+            Bash(cargo clippy -- -D warnings)
+            Bash(cargo fmt)
+            Bash(cargo fmt -- --check)
+            Bash(cargo doc)
+            Bash(cargo doc --no-deps)
+            Bash(cargo check)
+            Bash(cargo tree)
+            Bash(cargo audit)
+            Bash(cargo tarpaulin --features nats_integration_tests)
+            Bash(find . -name "*.proto" -type f)
+            Bash(protoc --version)
+            Bash(nats-server --version)
           
-          # Optional: Trigger when specific user is assigned to an issue
-          # assignee_trigger: "claude-bot"
+          # Custom instructions for the peer-observer project
+          custom_instructions: |
+            You are helping with peer-observer, a Rust-based Bitcoin P2P monitoring system that uses eBPF/USDT tracepoints 
+            to observe network behavior and detect anomalies. Key architectural aspects:
+            
+            1. **System Architecture**:
+               - **Extractors**: Connect to Bitcoin Core nodes via different interfaces:
+                 - `ebpf-extractor`: Uses USDT tracepoints via libbpf-rs for real-time P2P events
+                 - `rpc-extractor`: Periodic RPC queries using corepc
+               - **NATS.io Message Bus**: PUB-SUB architecture for event distribution
+               - **Tools**: Various consumers (logger, metrics, websocket, addr-connectivity) that process events
+               - **Protobuf**: All messages are serialized as protobuf for language interoperability
+            
+            2. **eBPF/BPF Considerations**:
+               - Understand libbpf-rs usage for USDT (User Statically-Defined Tracing) probes
+               - Bitcoin Core tracepoints capture P2P messages, connections, mempool changes
+               - Consider kernel/userspace boundary and performance implications
+               - Ring buffer and perf buffer usage for event transfer
+               - Root/CAP_BPF privileges required for deployment
+            
+            3. **Bitcoin P2P Protocol**:
+               - P2P message types: version, verack, addr, addrv2, inv, getdata, tx, block, etc.
+               - Connection lifecycle: handshake, message exchange, disconnection
+               - Peer behavior patterns and anomaly detection
+               - Honeypot/honeynode operational security
+               - Mempool event tracking and transaction propagation
+            
+            4. **Rust Best Practices**:
+               - Use tokio for async runtime across all components
+               - rust-bitcoin for protocol message deserialization
+               - async-nats for NATS client connections
+               - prost for protobuf code generation
+               - tracing crate for structured logging
+               - Proper error handling with anyhow or thiserror
+            
+            5. **NATS.io Integration**:
+               - Subject hierarchy design (e.g., bitcoin.p2p.*, bitcoin.mempool.*, bitcoin.rpc.*)
+               - Message delivery guarantees and reconnection logic
+               - Backpressure handling for high message volumes
+               - Consider JetStream for persistence if needed
+            
+            6. **Testing Strategy**:
+               - Integration tests require `nats_integration_tests` feature flag
+               - Set NATS_SERVER_BINARY env var if not using nix-shell
+               - Mock Bitcoin Core interactions for unit tests
+               - Test coverage with cargo tarpaulin
+               - Consider testing against different Bitcoin network types (mainnet, testnet, signet)
+            
+            7. **Performance & Monitoring**:
+               - Handle high-volume P2P traffic (thousands of msgs/sec)
+               - Efficient protobuf serialization/deserialization
+               - Memory usage for long-running extractors
+               - Prometheus metrics via the metrics tool
+               - Consider impact on monitored Bitcoin Core nodes
+            
+            8. **Security & Operational Concerns**:
+               - Honeynodes should be passive and well-behaving
+               - Avoid leaking honeynode IP addresses
+               - Validate all P2P data before processing
+               - Isolate monitoring infrastructure from production
+               - Consider rate limiting and DOS protection
+            
+            9. **Development Environment**:
+               - Project uses Nix for reproducible builds (see nix-shell)
+               - Multiple workspace members (extractors/*, tools/*, shared)
+               - Protobuf definitions in protobuf/ directory
+               - Python tools use protobuf/python-types for deserialization
+            
+            When reviewing code or answering questions, consider the distributed nature of the system, 
+            the real-time requirements of P2P monitoring, and the security implications of running honeynodes.
+            Provide Rust-idiomatic solutions that work well with eBPF constraints and high-throughput message processing.
           
-          # Optional: Allow Claude to run specific commands
-          # allowed_tools: "Bash(npm install),Bash(npm run build),Bash(npm run test:*),Bash(npm run lint:*)"
-          
-          # Optional: Add custom instructions for Claude to customize its behavior for your project
-          # custom_instructions: |
-          #   Follow our coding standards
-          #   Ensure all new code has tests
-          #   Use TypeScript for new files
-          
-          # Optional: Custom environment variables for Claude
-          # claude_env: |
-          #   NODE_ENV: test
-
+          # Environment variables for testing
+          claude_env: |
+            RUST_LOG: debug
+            RUST_BACKTRACE: 1
+            # NATS_SERVER_BINARY: /path/to/nats-server (if not using nix-shell)
