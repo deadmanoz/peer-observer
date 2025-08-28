@@ -111,22 +111,22 @@ impl PeerTxState {
 
 /// Main transaction tracker with thread-safe access
 #[derive(Debug, Clone)]
-pub struct TransactionTracker {
-    inner: Arc<Mutex<TransactionTrackerInner>>,
+pub struct TxRelayTracker {
+    inner: Arc<Mutex<TxRelayTrackerInner>>,
 }
 
 #[derive(Debug)]
-struct TransactionTrackerInner {
+struct TxRelayTrackerInner {
     /// Per-peer tracking state
     peer_states: HashMap<u64, PeerTxState>,
     /// Last cleanup time
     last_cleanup: Instant,
 }
 
-impl TransactionTracker {
+impl TxRelayTracker {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(TransactionTrackerInner {
+            inner: Arc::new(Mutex::new(TxRelayTrackerInner {
                 peer_states: HashMap::new(),
                 last_cleanup: Instant::now(),
             })),
@@ -302,7 +302,7 @@ impl TransactionTracker {
     }
 }
 
-impl TransactionTrackerInner {
+impl TxRelayTrackerInner {
     /// Force cleanup of old data
     fn cleanup_old_data(&mut self) {
         let cutoff_age = Instant::now() - PEER_TIMEOUT;
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_unsolicited_detection() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
         let txid = TxId::from_txid(b"test_txid".to_vec());
         let wtxid = TxId::from_wtxid(b"test_wtxid".to_vec());
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_solicited_detection() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
         let txid = TxId::from_txid(b"test_txid".to_vec());
         let wtxid = TxId::from_wtxid(b"test_wtxid".to_vec());
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn test_unannounced_detection() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
         let txid = TxId::from_txid(b"test_txid".to_vec());
         let wtxid = TxId::from_wtxid(b"test_wtxid".to_vec());
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_announced_detection() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
         let txid = TxId::from_txid(b"test_txid".to_vec());
         let wtxid = TxId::from_wtxid(b"test_wtxid".to_vec());
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_memory_limits() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
 
         // Add more than the limit
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_peer_cleanup() {
-        let tracker = TransactionTracker::new();
+        let tracker = TxRelayTracker::new();
         let peer_id = 1;
         let txid = TxId::from_txid(b"test_txid".to_vec());
 

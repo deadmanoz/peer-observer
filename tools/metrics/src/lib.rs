@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 
-use tx_tracker::{TransactionTracker, TxStatus};
+use tx_tracker::{TxRelayTracker, TxStatus};
 
 pub mod error;
 mod metrics;
@@ -68,7 +68,7 @@ pub async fn run(
     log::info!(target: LOG_TARGET, "Starting metrics-server...",);
 
     let metrics = metrics::Metrics::new();
-    let tx_tracker = TransactionTracker::new();
+    let tx_tracker = TxRelayTracker::new();
 
     metricserver::start(&args.metrics_address, Some(metrics.registry.clone()))?;
     log::info!(target: LOG_TARGET, "metrics-server listening on: {}", args.metrics_address);
@@ -87,7 +87,7 @@ pub async fn run(
         shared::tokio::select! {
             maybe_msg = sub.next() => {
                 if let Some(msg) = maybe_msg {
-                    handle_event(msg, metrics.clone(), Some(tx_tracker.clone()))?;
+                    handle_event(msg, metrics.clone(), tx_tracker.clone())?;
                 } else {
                     break; // subscription ended
                 }
@@ -116,17 +116,17 @@ pub async fn run(
 fn handle_event(
     msg: async_nats::Message,
     metrics: metrics::Metrics,
-    tx_tracker: Option<TransactionTracker>,
+    tx_tracker: TxRelayTracker,
 ) -> Result<(), error::RuntimeError> {
     let unwrapped = event_msg::EventMsg::decode(msg.payload)?;
     if let Some(event) = unwrapped.event {
         match event {
             Event::Msg(msg) => {
-                handle_p2p_message(&msg, unwrapped.timestamp, metrics, tx_tracker.as_ref());
+                handle_p2p_message(&msg, unwrapped.timestamp, metrics, &tx_tracker);
             }
             Event::Conn(c) => {
                 if let Some(e) = c.event {
-                    handle_connection_event(&e, unwrapped.timestamp, metrics, tx_tracker.as_ref());
+                    handle_connection_event(&e, unwrapped.timestamp, metrics, &tx_tracker);
                 }
             }
             Event::Addrman(a) => {
@@ -450,19 +450,17 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
 }
 
 /// Helper function to cleanup transaction tracking for a disconnected peer
-fn cleanup_peer_tracking(tx_tracker: Option<&TransactionTracker>, peer_id: u64, metrics: &metrics::Metrics) {
-    if let Some(tracker) = tx_tracker {
-        tracker.remove_peer(peer_id);
+fn cleanup_peer_tracking(tx_tracker: &TxRelayTracker, peer_id: u64, metrics: &metrics::Metrics) {
+    tx_tracker.remove_peer(peer_id);
+    
+    // Get peer address for metrics cleanup
+    if let Some(peer_addr) = tx_tracker.get_peer_address(peer_id) {
+        let peer_id_str = peer_id.to_string();
         
-        // Get peer address for metrics cleanup
-        if let Some(peer_addr) = tracker.get_peer_address(peer_id) {
-            let peer_id_str = peer_id.to_string();
-            
-            // Remove per-peer metrics from registry to prevent cardinality buildup
-            let _ = metrics.tx_unsolicited_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
-            let _ = metrics.tx_unannounced_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
-            let _ = metrics.tx_peer_last_activity.remove_label_values(&[&peer_id_str, &peer_addr]);
-        }
+        // Remove per-peer metrics from registry to prevent cardinality buildup
+        let _ = metrics.tx_unsolicited_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
+        let _ = metrics.tx_unannounced_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
+        let _ = metrics.tx_peer_last_activity.remove_label_values(&[&peer_id_str, &peer_addr]);
     }
 }
 
@@ -470,7 +468,7 @@ fn handle_connection_event(
     cevent: &connection_event::Event,
     timestamp: u64,
     metrics: metrics::Metrics,
-    tx_tracker: Option<&TransactionTracker>,
+    tx_tracker: &TxRelayTracker,
 ) {
     match cevent {
         connection_event::Event::Inbound(i) => {
@@ -580,7 +578,7 @@ fn handle_p2p_message(
     msg: &net_msg::Message,
     timestamp: u64,
     metrics: metrics::Metrics,
-    tx_tracker: Option<&TransactionTracker>,
+    tx_tracker: &TxRelayTracker,
 ) {
     let conn_type = msg.meta.conn_type.to_string();
     let direction = if msg.meta.inbound {
@@ -741,68 +739,62 @@ fn handle_p2p_message(
                 }
 
                 // Track INV messages for transaction relay analysis
-                if let Some(tracker) = tx_tracker {
-                    tracker.register_peer_address(msg.meta.peer_id, ip.clone());
-                    tracker.handle_inv_message(msg.meta.peer_id, &inv.items);
+                tx_tracker.register_peer_address(msg.meta.peer_id, ip.clone());
+                tx_tracker.handle_inv_message(msg.meta.peer_id, &inv.items);
 
-                    // Update activity timestamp
-                    metrics
-                        .tx_peer_last_activity
-                        .with_label_values(&[&msg.meta.peer_id.to_string()])
-                        .set(timestamp as i64);
-                }
+                // Update activity timestamp
+                metrics
+                    .tx_peer_last_activity
+                    .with_label_values(&[&msg.meta.peer_id.to_string()])
+                    .set(timestamp as i64);
             }
             Msg::Getdata(getdata) => {
                 // Track GETDATA messages for transaction relay analysis
-                if let Some(tracker) = tx_tracker {
-                    tracker.register_peer_address(msg.meta.peer_id, ip.clone());
-                    tracker.handle_getdata_message(msg.meta.peer_id, &getdata.items);
+                tx_tracker.register_peer_address(msg.meta.peer_id, ip.clone());
+                tx_tracker.handle_getdata_message(msg.meta.peer_id, &getdata.items);
 
-                    // Update activity timestamp
-                    metrics
-                        .tx_peer_last_activity
-                        .with_label_values(&[&msg.meta.peer_id.to_string()])
-                        .set(timestamp as i64);
-                }
+                // Update activity timestamp
+                metrics
+                    .tx_peer_last_activity
+                    .with_label_values(&[&msg.meta.peer_id.to_string()])
+                    .set(timestamp as i64);
             }
             Msg::Tx(tx) => {
                 // Process transaction for unsolicited/unannounced detection
-                if let Some(tracker) = tx_tracker {
-                    // Register peer address for metrics labeling
-                    tracker.register_peer_address(msg.meta.peer_id, ip.clone());
+                // Register peer address for metrics labeling
+                tx_tracker.register_peer_address(msg.meta.peer_id, ip.clone());
 
-                    if let Some(status) =
-                        tracker.handle_tx_message(msg.meta.peer_id, tx, msg.meta.inbound)
-                    {
-                        // Get peer address from tracker (fallback to current IP if not found)
-                        let peer_addr = tracker
-                            .get_peer_address(msg.meta.peer_id)
-                            .unwrap_or_else(|| ip.clone());
-                        match status {
-                            TxStatus::Unsolicited => {
-                                // Update per-peer metric
-                                metrics
-                                    .tx_unsolicited_by_peer
-                                    .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
-                                    .inc();
-                            }
-                            TxStatus::Unannounced => {
-                                // Update per-peer metric
-                                metrics
-                                    .tx_unannounced_by_peer
-                                    .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
-                                    .inc();
-                            }
-                            _ => {}
+                if let Some(status) =
+                    tx_tracker.handle_tx_message(msg.meta.peer_id, tx, msg.meta.inbound)
+                {
+                    // Get peer address from tracker (fallback to current IP if not found)
+                    let peer_addr = tx_tracker
+                        .get_peer_address(msg.meta.peer_id)
+                        .unwrap_or_else(|| ip.clone());
+                    match status {
+                        TxStatus::Unsolicited => {
+                            // Update per-peer metric
+                            metrics
+                                .tx_unsolicited_by_peer
+                                .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
+                                .inc();
                         }
+                        TxStatus::Unannounced => {
+                            // Update per-peer metric
+                            metrics
+                                .tx_unannounced_by_peer
+                                .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
+                                .inc();
+                        }
+                        _ => {}
                     }
-
-                    // Update activity timestamp
-                    metrics
-                        .tx_peer_last_activity
-                        .with_label_values(&[&msg.meta.peer_id.to_string()])
-                        .set(timestamp as i64);
                 }
+
+                // Update activity timestamp
+                metrics
+                    .tx_peer_last_activity
+                    .with_label_values(&[&msg.meta.peer_id.to_string()])
+                    .set(timestamp as i64);
             }
             Msg::Ping(_) => {
                 if msg.meta.inbound {
