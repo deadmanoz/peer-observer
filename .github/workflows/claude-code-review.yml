@@ -3,20 +3,35 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+    # Focus on Rust source files and important config files
+    paths:
+      - "extractors/**/*.rs"
+      - "tools/**/*.rs"
+      - "shared/**/*.rs"
+      - "protobuf/**/*.proto"
+      - "protobuf/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "**/*.ebpf.c"  # eBPF programs
+      - "**/*.bpf.c"    # BPF programs
+      - ".github/workflows/*.yml"
+      - "nix/**/*.nix"  # Nix configurations
+
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to review'
+        required: true
+        type: number
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login == 'deadmanoz' ||
+      github.event.pull_request.author_association == 'OWNER' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR'
     
     runs-on: ubuntu-latest
     permissions:
@@ -30,6 +45,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/pull/{0}/merge', github.event.inputs.pr_number) || '' }}
 
       - name: Run Claude Code Review
         id: claude-review
@@ -42,37 +58,71 @@ jobs:
           
           # Direct prompt for automated review (no @claude mention needed)
           direct_prompt: |
-            Please review this pull request and provide feedback on:
-            - Code quality and best practices
-            - Potential bugs or issues
-            - Performance considerations
-            - Security concerns
-            - Test coverage
+            Please review this pull request for the peer-observer Bitcoin P2P monitoring system. Focus on:
+
+            **Rust Code Quality:**
+            - Memory safety and proper use of ownership/borrowing
+            - Error handling with Result<T, E> and proper error propagation
+            - Efficient async/await patterns with tokio runtime
+            - Proper use of Arc<RwLock<T>> for shared state in async contexts
+            - Idiomatic Rust patterns and effective use of iterators
             
-            Be constructive and helpful in your feedback.
+            **eBPF/BPF Integration:**
+            - Correct use of libbpf-rs for USDT tracepoint handling
+            - Safety of eBPF programs and proper bounds checking
+            - Efficient data transfer between kernel and userspace
+            - Proper handling of perf buffers and ring buffers
+            - Memory map sizes and performance implications
+            
+            **Bitcoin P2P Protocol:**
+            - Correct handling of P2P protocol messages using rust-bitcoin
+            - Proper deserialization of network messages
+            - Understanding of addr/addrv2 message formats
+            - Connection state management and peer lifecycle
+            - Mempool event handling and transaction tracking
+            
+            **NATS.io Messaging:**
+            - Efficient protobuf serialization/deserialization
+            - Proper NATS connection management and reconnection logic
+            - Subject naming conventions and message routing
+            - Backpressure handling for high-throughput scenarios
+            - Error handling for network interruptions
+            
+            **Multi-Component Architecture:**
+            - Clean separation between extractors and tools
+            - Proper use of the shared module for common types
+            - Consistent protobuf schema usage across components
+            - Consider scalability for multiple Bitcoin Core nodes
+            
+            **Performance & Resource Usage:**
+            - CPU and memory efficiency for long-running processes
+            - Batch processing where applicable
+            - Proper cleanup of resources (connections, subscriptions)
+            - Consider impact on monitored Bitcoin Core nodes
+            
+            **Security Considerations:**
+            - Validate all external inputs from P2P network
+            - Safe handling of potentially malicious peer data
+            - Proper isolation between monitoring and production nodes
+            - Consider honeypot operational security implications
+            
+            **Testing:**
+            - Integration tests with NATS server (feature flag: nats_integration_tests)
+            - Mock testing for Bitcoin Core RPC interactions
+            - Unit tests for protobuf message handling
+            - Consider test coverage with tarpaulin
+            
+            Be specific about improvements for monitoring high-volume P2P traffic and detecting anomalies.
 
-          # Optional: Use sticky comments to make Claude reuse the same comment on subsequent pushes to the same PR
-          # use_sticky_comment: true
+          # Use sticky comments for iterative review
+          use_sticky_comment: true
           
-          # Optional: Customize review based on file types
-          # direct_prompt: |
-          #   Review this PR focusing on:
-          #   - For TypeScript files: Type safety and proper interface usage
-          #   - For API endpoints: Security, input validation, and error handling
-          #   - For React components: Performance, accessibility, and best practices
-          #   - For tests: Coverage, edge cases, and test quality
-          
-          # Optional: Different prompts for different authors
-          # direct_prompt: |
-          #   ${{ github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR' && 
-          #   'Welcome! Please review this PR from a first-time contributor. Be encouraging and provide detailed explanations for any suggestions.' ||
-          #   'Please provide a thorough code review focusing on our coding standards and best practices.' }}
-          
-          # Optional: Add specific tools for running tests or linting
-          # allowed_tools: "Bash(npm run test),Bash(npm run lint),Bash(npm run typecheck)"
-          
-          # Optional: Skip review for certain conditions
-          # if: |
-          #   !contains(github.event.pull_request.title, '[skip-review]') &&
-          #   !contains(github.event.pull_request.title, '[WIP]')
-
+          # Add project-specific tools
+          allowed_tools: |
+            Bash(cargo build)
+            Bash(cargo test)
+            Bash(cargo test --features nats_integration_tests)
+            Bash(cargo clippy)
+            Bash(cargo fmt -- --check)
+            Bash(cargo check)
+            Bash(cargo tarpaulin --features nats_integration_tests)
