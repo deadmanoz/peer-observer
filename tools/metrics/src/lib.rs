@@ -450,7 +450,7 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
 }
 
 /// Helper function to cleanup transaction tracking for a disconnected peer
-fn cleanup_peer_tracking(tx_tracker: Option<&crate::TxTracker>, peer_id: u64) {
+fn cleanup_peer_tracking(tx_tracker: Option<&TransactionTracker>, peer_id: u64) {
     if let Some(tracker) = tx_tracker {
         tracker.remove_peer(peer_id);
     }
