@@ -451,9 +451,7 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
 
 /// Helper function to cleanup transaction tracking for a disconnected peer
 fn cleanup_peer_tracking(tx_tracker: &TxRelayTracker, peer_id: u64, metrics: &metrics::Metrics) {
-    tx_tracker.remove_peer(peer_id);
-    
-    // Get peer address for metrics cleanup
+    // Get peer address BEFORE removing the peer from tracker
     if let Some(peer_addr) = tx_tracker.get_peer_address(peer_id) {
         let peer_id_str = peer_id.to_string();
         
@@ -462,6 +460,9 @@ fn cleanup_peer_tracking(tx_tracker: &TxRelayTracker, peer_id: u64, metrics: &me
         let _ = metrics.tx_unannounced_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
         let _ = metrics.tx_peer_last_activity.remove_label_values(&[&peer_id_str, &peer_addr]);
     }
+    
+    // Now remove the peer from transaction tracking
+    tx_tracker.remove_peer(peer_id);
 }
 
 fn handle_connection_event(
