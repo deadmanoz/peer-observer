@@ -449,6 +449,13 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
     }
 }
 
+/// Helper function to cleanup transaction tracking for a disconnected peer
+fn cleanup_peer_tracking(tx_tracker: Option<&crate::TxTracker>, peer_id: u64) {
+    if let Some(tracker) = tx_tracker {
+        tracker.remove_peer(peer_id);
+    }
+}
+
 fn handle_connection_event(
     cevent: &connection_event::Event,
     timestamp: u64,
@@ -517,9 +524,7 @@ fn handle_connection_event(
                 .inc();
 
             // Remove peer from transaction tracking
-            if let Some(tracker) = tx_tracker {
-                tracker.remove_peer(c.conn.peer_id);
-            }
+            cleanup_peer_tracking(tx_tracker, c.conn.peer_id);
         }
         connection_event::Event::InboundEvicted(e) => {
             metrics.conn_evicted_inbound.inc();
@@ -532,9 +537,7 @@ fn handle_connection_event(
                 .inc();
 
             // Remove peer from transaction tracking
-            if let Some(tracker) = tx_tracker {
-                tracker.remove_peer(e.conn.peer_id);
-            }
+            cleanup_peer_tracking(tx_tracker, e.conn.peer_id);
         }
         connection_event::Event::Misbehaving(m) => {
             metrics

@@ -55,6 +55,17 @@ struct PeerTxState {
     last_message_time: Instant,
 }
 
+impl Default for PeerTxState {
+    fn default() -> Self {
+        Self {
+            address: String::new(),
+            recent_invs: VecDeque::new(),
+            recent_getdata: VecDeque::new(),
+            last_message_time: Instant::now(),
+        }
+    }
+}
+
 impl PeerTxState {
     fn new(address: String) -> Self {
         Self {
@@ -139,10 +150,7 @@ impl TransactionTracker {
     /// Track an INV message we sent to a peer
     pub fn track_inv(&self, peer_id: u64, txid: TxId) {
         if let Ok(mut inner) = self.inner.lock() {
-            let peer_state = inner
-                .peer_states
-                .entry(peer_id)
-                .or_insert_with(|| PeerTxState::new(String::new()));
+            let peer_state = inner.peer_states.entry(peer_id).or_default();
             peer_state.add_inv(txid);
         }
     }
@@ -150,10 +158,7 @@ impl TransactionTracker {
     /// Track a GETDATA message we sent to a peer
     pub fn track_getdata(&self, peer_id: u64, txid: TxId) {
         if let Ok(mut inner) = self.inner.lock() {
-            let peer_state = inner
-                .peer_states
-                .entry(peer_id)
-                .or_insert_with(|| PeerTxState::new(String::new()));
+            let peer_state = inner.peer_states.entry(peer_id).or_default();
             peer_state.add_getdata(txid);
         }
     }
