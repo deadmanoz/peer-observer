@@ -450,9 +450,19 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
 }
 
 /// Helper function to cleanup transaction tracking for a disconnected peer
-fn cleanup_peer_tracking(tx_tracker: Option<&TransactionTracker>, peer_id: u64) {
+fn cleanup_peer_tracking(tx_tracker: Option<&TransactionTracker>, peer_id: u64, metrics: &metrics::Metrics) {
     if let Some(tracker) = tx_tracker {
         tracker.remove_peer(peer_id);
+        
+        // Get peer address for metrics cleanup
+        if let Some(peer_addr) = tracker.get_peer_address(peer_id) {
+            let peer_id_str = peer_id.to_string();
+            
+            // Remove per-peer metrics from registry to prevent cardinality buildup
+            let _ = metrics.tx_unsolicited_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
+            let _ = metrics.tx_unannounced_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
+            let _ = metrics.tx_peer_last_activity.remove_label_values(&[&peer_id_str, &peer_addr]);
+        }
     }
 }
 
@@ -524,7 +534,7 @@ fn handle_connection_event(
                 .inc();
 
             // Remove peer from transaction tracking
-            cleanup_peer_tracking(tx_tracker, c.conn.peer_id);
+            cleanup_peer_tracking(tx_tracker, c.conn.peer_id, &metrics);
         }
         connection_event::Event::InboundEvicted(e) => {
             metrics.conn_evicted_inbound.inc();
@@ -537,7 +547,7 @@ fn handle_connection_event(
                 .inc();
 
             // Remove peer from transaction tracking
-            cleanup_peer_tracking(tx_tracker, e.conn.peer_id);
+            cleanup_peer_tracking(tx_tracker, e.conn.peer_id, &metrics);
         }
         connection_event::Event::Misbehaving(m) => {
             metrics
