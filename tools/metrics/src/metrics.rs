@@ -243,9 +243,8 @@ pub struct Metrics {
     pub rpc_peer_info_ping_mean: Gauge,
     pub rpc_peer_info_minping_median: Gauge,
     pub rpc_peer_info_minping_mean: Gauge,
-    pub tx_unsolicited_by_peer: IntCounterVec,
-    pub tx_unannounced_by_peer: IntCounterVec,
-    pub tx_peer_last_activity: IntGaugeVec,
+    pub tx_unsolicited_top_k: IntGaugeVec,
+    pub tx_unannounced_top_k: IntGaugeVec,
 }
 
 impl Metrics {
@@ -338,9 +337,8 @@ impl Metrics {
         g!(rpc_peer_info_ping_mean, "Mean ping (in milliseconds) of all connected peers.", registry);
         g!(rpc_peer_info_minping_median, "Median min_ping (in milliseconds) of all connected peers.", registry);
         g!(rpc_peer_info_minping_mean, "Mean min_ping (in milliseconds) of all connected peers.", registry);
-        icv!(tx_unsolicited_by_peer, "Number of unsolicited transactions received per peer", [LABEL_PEER_ID, LABEL_PEER_ADDR], registry);
-        icv!(tx_unannounced_by_peer, "Number of unannounced transaction requests per peer", [LABEL_PEER_ID, LABEL_PEER_ADDR], registry);
-        igv!(tx_peer_last_activity, "Timestamp of last transaction activity per peer", [LABEL_PEER_ID], registry);
+        igv!(tx_unsolicited_top_k, "Top-K peers by unsolicited transaction count", ["rank"], registry);
+        igv!(tx_unannounced_top_k, "Top-K peers by unannounced transaction request count", ["rank"], registry);
 
 
         Self {
@@ -430,9 +428,8 @@ impl Metrics {
             rpc_peer_info_ping_mean,
             rpc_peer_info_minping_median,
             rpc_peer_info_minping_mean,
-            tx_unsolicited_by_peer,
-            tx_unannounced_by_peer,
-            tx_peer_last_activity,
+            tx_unsolicited_top_k,
+            tx_unannounced_top_k,
         }
     }
 }

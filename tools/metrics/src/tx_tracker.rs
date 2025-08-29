@@ -109,6 +109,132 @@ impl PeerTxState {
     }
 }
 
+/// Top-K tracker for managing bounded-cardinality metrics
+#[derive(Debug)]
+pub struct TopKTracker {
+    /// Separate counters for each violation type (note: these are independent rankings!)
+    unsolicited_counts: HashMap<u64, u64>,  // peer_id -> count
+    unannounced_counts: HashMap<u64, u64>,  // peer_id -> count
+    
+    /// Peer metadata for logging
+    peer_addresses: HashMap<u64, String>,   // peer_id -> address
+    
+    /// Configuration
+    k: usize,  // Top-K size (default: 10)
+    
+    /// Update tracking
+    last_update: Instant,
+    update_interval: Duration,  // How often to update Prometheus (e.g., 30s)
+}
+
+impl TopKTracker {
+    pub fn new(k: usize, update_interval_secs: u64) -> Self {
+        Self {
+            unsolicited_counts: HashMap::new(),
+            unannounced_counts: HashMap::new(),
+            peer_addresses: HashMap::new(),
+            k,
+            last_update: Instant::now(),
+            update_interval: Duration::from_secs(update_interval_secs),
+        }
+    }
+    
+    /// Record an unsolicited transaction from a peer
+    pub fn record_unsolicited(&mut self, peer_id: u64, peer_addr: String) {
+        *self.unsolicited_counts.entry(peer_id).or_insert(0) += 1;
+        self.peer_addresses.insert(peer_id, peer_addr);
+    }
+    
+    /// Record an unannounced transaction request from a peer
+    pub fn record_unannounced(&mut self, peer_id: u64, peer_addr: String) {
+        *self.unannounced_counts.entry(peer_id).or_insert(0) += 1;
+        self.peer_addresses.insert(peer_id, peer_addr);
+    }
+    
+    /// Update Prometheus metrics if enough time has passed
+    pub fn maybe_update_metrics(&mut self, metrics: &crate::metrics::Metrics) {
+        if self.last_update.elapsed() >= self.update_interval {
+            self.update_prometheus_metrics(metrics);
+            self.last_update = Instant::now();
+        }
+    }
+    
+    /// Update Prometheus metrics with current top-K rankings
+    fn update_prometheus_metrics(&self, metrics: &crate::metrics::Metrics) {
+        // Update unsolicited top-K (separate ranking)
+        let mut unsolicited_sorted: Vec<_> = self.unsolicited_counts.iter().collect();
+        unsolicited_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        
+        for rank in 1..=self.k {
+            let rank_str = rank.to_string();
+            if let Some((peer_id, count)) = unsolicited_sorted.get(rank - 1) {
+                metrics.tx_unsolicited_top_k
+                    .with_label_values(&[&rank_str])
+                    .set(**count as i64);
+                    
+                // Log top 3 for investigation
+                if rank <= 3 {
+                    if let Some(addr) = self.peer_addresses.get(peer_id) {
+                        shared::log::info!(
+                            target: "tx_relay_top_k",
+                            "Top-{} unsolicited: peer {} ({}) with {} transactions",
+                            rank, peer_id, addr, count
+                        );
+                    }
+                }
+            } else {
+                // Clear metrics for ranks that don't exist
+                metrics.tx_unsolicited_top_k
+                    .with_label_values(&[&rank_str])
+                    .set(0);
+            }
+        }
+        
+        // Update unannounced top-K (separate ranking)
+        let mut unannounced_sorted: Vec<_> = self.unannounced_counts.iter().collect();
+        unannounced_sorted.sort_by(|a, b| b.1.cmp(a.1));
+        
+        for rank in 1..=self.k {
+            let rank_str = rank.to_string();
+            if let Some((peer_id, count)) = unannounced_sorted.get(rank - 1) {
+                metrics.tx_unannounced_top_k
+                    .with_label_values(&[&rank_str])
+                    .set(**count as i64);
+                    
+                // Log top 3 for investigation
+                if rank <= 3 {
+                    if let Some(addr) = self.peer_addresses.get(peer_id) {
+                        shared::log::info!(
+                            target: "tx_relay_top_k",
+                            "Top-{} unannounced: peer {} ({}) with {} transactions",
+                            rank, peer_id, addr, count
+                        );
+                    }
+                }
+            } else {
+                // Clear metrics for ranks that don't exist
+                metrics.tx_unannounced_top_k
+                    .with_label_values(&[&rank_str])
+                    .set(0);
+            }
+        }
+    }
+    
+    /// Remove a peer from tracking (called when peer disconnects)
+    pub fn remove_peer(&mut self, peer_id: u64) {
+        self.unsolicited_counts.remove(&peer_id);
+        self.unannounced_counts.remove(&peer_id);
+        self.peer_addresses.remove(&peer_id);
+    }
+    
+    /// Cleanup stale peers (those with no activity for a long time)
+    pub fn cleanup_stale_peers(&mut self, active_peers: &std::collections::HashSet<u64>) {
+        self.unsolicited_counts.retain(|peer_id, _| active_peers.contains(peer_id));
+        self.unannounced_counts.retain(|peer_id, _| active_peers.contains(peer_id));
+        self.peer_addresses.retain(|peer_id, _| active_peers.contains(peer_id));
+    }
+}
+
 /// Main transaction tracker with thread-safe access
 #[derive(Debug, Clone)]
 pub struct TxRelayTracker {
@@ -119,6 +245,8 @@ pub struct TxRelayTracker {
 struct TxRelayTrackerInner {
     /// Per-peer tracking state
     peer_states: HashMap<u64, PeerTxState>,
+    /// Top-K tracker for bounded cardinality metrics
+    top_k_tracker: TopKTracker,
     /// Last cleanup time
     last_cleanup: Instant,
 }
@@ -128,6 +256,7 @@ impl TxRelayTracker {
         Self {
             inner: Arc::new(Mutex::new(TxRelayTrackerInner {
                 peer_states: HashMap::new(),
+                top_k_tracker: TopKTracker::new(10, 30), // Top-10, update every 30 seconds
                 last_cleanup: Instant::now(),
             })),
         }
@@ -226,6 +355,7 @@ impl TxRelayTracker {
     pub fn remove_peer(&self, peer_id: u64) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.peer_states.remove(&peer_id);
+            inner.top_k_tracker.remove_peer(peer_id);
         }
     }
 
@@ -236,6 +366,27 @@ impl TxRelayTracker {
             .lock()
             .map(|inner| inner.peer_states.len())
             .unwrap_or(0)
+    }
+
+    /// Record an unsolicited transaction for top-K tracking
+    pub fn record_unsolicited_tx(&self, peer_id: u64, peer_addr: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.top_k_tracker.record_unsolicited(peer_id, peer_addr);
+        }
+    }
+    
+    /// Record an unannounced transaction for top-K tracking
+    pub fn record_unannounced_tx(&self, peer_id: u64, peer_addr: String) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.top_k_tracker.record_unannounced(peer_id, peer_addr);
+        }
+    }
+    
+    /// Update top-K metrics if enough time has passed
+    pub fn update_top_k_metrics(&self, metrics: &crate::metrics::Metrics) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.top_k_tracker.maybe_update_metrics(metrics);
+        }
     }
 
     /// Helper function to handle INV messages

@@ -450,18 +450,10 @@ fn handle_validation_event(e: &validation_event::Event, metrics: metrics::Metric
 }
 
 /// Helper function to cleanup transaction tracking for a disconnected peer
-fn cleanup_peer_tracking(tx_tracker: &TxRelayTracker, peer_id: u64, metrics: &metrics::Metrics) {
-    // Get peer address BEFORE removing the peer from tracker
-    if let Some(peer_addr) = tx_tracker.get_peer_address(peer_id) {
-        let peer_id_str = peer_id.to_string();
-        
-        // Remove per-peer metrics from registry to prevent cardinality buildup
-        let _ = metrics.tx_unsolicited_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
-        let _ = metrics.tx_unannounced_by_peer.remove_label_values(&[&peer_id_str, &peer_addr]);
-        let _ = metrics.tx_peer_last_activity.remove_label_values(&[&peer_id_str, &peer_addr]);
-    }
-    
-    // Now remove the peer from transaction tracking
+fn cleanup_peer_tracking(tx_tracker: &TxRelayTracker, peer_id: u64, _metrics: &metrics::Metrics) {
+    // Remove peer from both traditional tracking and top-K tracker
+    // Note: With top-K approach, we don't need to remove individual metrics
+    // since we use fixed-cardinality rank-based metrics
     tx_tracker.remove_peer(peer_id);
 }
 
@@ -743,22 +735,14 @@ fn handle_p2p_message(
                 tx_tracker.register_peer_address(msg.meta.peer_id, ip.clone());
                 tx_tracker.handle_inv_message(msg.meta.peer_id, &inv.items);
 
-                // Update activity timestamp
-                metrics
-                    .tx_peer_last_activity
-                    .with_label_values(&[&msg.meta.peer_id.to_string()])
-                    .set(timestamp as i64);
+                // Activity tracking is now handled internally by the top-K tracker
             }
             Msg::Getdata(getdata) => {
                 // Track GETDATA messages for transaction relay analysis
                 tx_tracker.register_peer_address(msg.meta.peer_id, ip.clone());
                 tx_tracker.handle_getdata_message(msg.meta.peer_id, &getdata.items);
 
-                // Update activity timestamp
-                metrics
-                    .tx_peer_last_activity
-                    .with_label_values(&[&msg.meta.peer_id.to_string()])
-                    .set(timestamp as i64);
+                // Activity tracking is now handled internally by the top-K tracker
             }
             Msg::Tx(tx) => {
                 // Process transaction for unsolicited/unannounced detection
@@ -772,30 +756,21 @@ fn handle_p2p_message(
                     let peer_addr = tx_tracker
                         .get_peer_address(msg.meta.peer_id)
                         .unwrap_or_else(|| ip.clone());
+                    
+                    // Record transaction in top-K tracker (separate rankings for each type)
                     match status {
                         TxStatus::Unsolicited => {
-                            // Update per-peer metric
-                            metrics
-                                .tx_unsolicited_by_peer
-                                .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
-                                .inc();
+                            tx_tracker.record_unsolicited_tx(msg.meta.peer_id, peer_addr);
                         }
                         TxStatus::Unannounced => {
-                            // Update per-peer metric
-                            metrics
-                                .tx_unannounced_by_peer
-                                .with_label_values(&[&msg.meta.peer_id.to_string(), &peer_addr])
-                                .inc();
+                            tx_tracker.record_unannounced_tx(msg.meta.peer_id, peer_addr);
                         }
                         _ => {}
                     }
                 }
 
-                // Update activity timestamp
-                metrics
-                    .tx_peer_last_activity
-                    .with_label_values(&[&msg.meta.peer_id.to_string()])
-                    .set(timestamp as i64);
+                // Update top-K metrics periodically (this is cheap - only updates if interval elapsed)
+                tx_tracker.update_top_k_metrics(&metrics);
             }
             Msg::Ping(_) => {
                 if msg.meta.inbound {
