@@ -39,6 +39,11 @@ fn setup() {
     });
 }
 
+/// Bridges Bitcoin Core's `debug.log` into a named pipe for the log extractor.
+///
+/// The log extractor reads from a pipe (not a regular file), so we create one
+/// with `mkfifo` and spawn a background `tail -f` process that continuously
+/// streams new log lines from `log_path` into `pipe_path`.
 fn spawn_pipe(log_path: String, pipe_path: String) {
     // Create pipe
     std::process::Command::new("mkfifo")
@@ -69,6 +74,11 @@ fn make_test_args(nats_port: u16, bitcoind_pipe: String) -> Args {
     )
 }
 
+/// Starts a regtest `bitcoind` node with the given configuration.
+///
+/// The binary is resolved from the `BITCOIND_EXE` environment variable
+/// (via `corepc_node::exe_path`); if unset, a pre-built binary is
+/// downloaded automatically.
 fn setup_node(conf: corepc_node::Conf) -> corepc_node::Node {
     info!("env BITCOIND_EXE={:?}", std::env::var("BITCOIND_EXE"));
     info!("exe_path={:?}", corepc_node::exe_path());
@@ -82,6 +92,12 @@ fn setup_node(conf: corepc_node::Conf) -> corepc_node::Node {
     corepc_node::Node::from_downloaded_with_conf(&conf).unwrap()
 }
 
+/// Creates a two-node regtest topology:
+/// - node1 listens for inbound P2P connections
+/// - node2 connects to node1.
+///
+/// `node1_args` are appended as extra `bitcoind` CLI flags (e.g. `-debug=validation`) so tests
+/// can enable the specific logging needed to trigger the events they want to observe.
 fn setup_two_connected_nodes(node1_args: Vec<&str>) -> (corepc_node::Node, corepc_node::Node) {
     // node1 listens for p2p connections
     let mut node1_conf = corepc_node::Conf::default();
@@ -100,6 +116,25 @@ fn setup_two_connected_nodes(node1_args: Vec<&str>) -> (corepc_node::Node, corep
     (node1, node2)
 }
 
+/// Integration test harness that verifies the log extractor produces expected
+/// NATS events in response to Bitcoin Core activity.
+///
+/// 1. Initializes logging and spins up two connected regtest nodes (node1
+///    accepts inbound P2P; node2 connects to it). `args` are passed as extra
+///    bitcoind CLI flags to node1 (e.g. `-debug=validation`).
+/// 2. Starts a throwaway NATS server and launches the log extractor, which
+///    reads node1's `debug.log` via a named pipe (`mkfifo` + `tail -f`) and
+///    publishes protobuf-encoded events to NATS.
+/// 3. Calls `test_setup` against node1's RPC client so the test can trigger
+///    the specific node behaviour it wants to observe (mine a block, submit a
+///    transaction, etc.).
+/// 4. Subscribes to all NATS subjects and polls incoming messages, decoding
+///    each into a `PeerObserverEvent` and passing it to `check_event`. The
+///    loop breaks as soon as `check_event` returns `true`, signalling that the
+///    expected event was received.
+/// 5. Panics if the expected event is not seen within `TEST_TIMEOUT_SECONDS`.
+/// 6. Sends a shutdown signal to the log extractor task and awaits its clean
+///    exit before returning.
 async fn check(
     args: Vec<&str>,
     test_setup: fn(&corepc_node::Client),
