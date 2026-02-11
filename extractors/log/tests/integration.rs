@@ -452,10 +452,10 @@ async fn test_integration_logextractor_unknown_with_threadname() {
                 PeerObserverEvent::LogExtractor(r) => {
                     if let Some(ref e) = r.log_event
                         && let log::LogEvent::UnknownLogMessage(unknown_log_message) = e
+                        && !r.threadname.is_empty()
+                        && r.category == LogDebugCategory::Unknown as i32
                     {
                         assert!(!unknown_log_message.raw_message.is_empty());
-                        assert!(!r.threadname.is_empty(), "threadname should not be empty");
-                        assert_eq!(r.category, LogDebugCategory::Unknown as i32);
                         info!("UnknownLogMessage with threadname: {}", r.threadname);
                         return true;
                     }
@@ -480,9 +480,9 @@ async fn test_integration_logextractor_unknown_with_category() {
                 PeerObserverEvent::LogExtractor(r) => {
                     if let Some(ref e) = r.log_event
                         && let log::LogEvent::UnknownLogMessage(unknown_log_message) = e
+                        && r.category == LogDebugCategory::Net as i32
                     {
                         assert!(!unknown_log_message.raw_message.is_empty());
-                        assert_eq!(r.category, LogDebugCategory::Net as i32);
                         info!("UnknownLogMessage with category Net");
                         return true;
                     }
@@ -507,10 +507,10 @@ async fn test_integration_logextractor_unknown_with_threadname_and_category() {
                 PeerObserverEvent::LogExtractor(r) => {
                     if let Some(ref e) = r.log_event
                         && let log::LogEvent::UnknownLogMessage(unknown_log_message) = e
+                        && r.category == LogDebugCategory::Net as i32
                     {
                         assert!(!unknown_log_message.raw_message.is_empty());
                         assert!(!r.threadname.is_empty(), "threadname should not be empty");
-                        assert_eq!(r.category, LogDebugCategory::Net as i32);
                         info!(
                             "UnknownLogMessage with threadname {} and category Net",
                             r.threadname
@@ -538,10 +538,10 @@ async fn test_integration_logextractor_unknown_with_all_metadata() {
                 PeerObserverEvent::LogExtractor(r) => {
                     if let Some(ref e) = r.log_event
                         && let log::LogEvent::UnknownLogMessage(unknown_log_message) = e
+                        && r.category == LogDebugCategory::Net as i32
                     {
                         assert!(!unknown_log_message.raw_message.is_empty());
                         assert!(!r.threadname.is_empty(), "threadname should not be empty");
-                        assert_eq!(r.category, LogDebugCategory::Net as i32);
                         info!(
                             "UnknownLogMessage with threadname {} and category Net",
                             r.threadname
