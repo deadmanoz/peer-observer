@@ -70,6 +70,11 @@ fn make_test_args(nats_port: u16, bitcoind_pipe: String) -> Args {
 }
 
 fn setup_node(conf: corepc_node::Conf) -> corepc_node::Node {
+    let mut conf = conf;
+    // Increase attempts for slower hardware where bitcoind warmup
+    // can exceed corepc_node's default 2-second wallet-ready timeout.
+    conf.attempts = 10;
+
     info!("env BITCOIND_EXE={:?}", std::env::var("BITCOIND_EXE"));
     info!("exe_path={:?}", corepc_node::exe_path());
 
