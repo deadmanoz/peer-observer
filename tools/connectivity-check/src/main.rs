@@ -325,8 +325,8 @@ async fn main() {
     let (input_sender, input_receiver) = unbounded();
     let (output_sender, output_receiver) = unbounded();
 
-    metricserver::start(&args.metrics_address, None).unwrap();
-    log::info!("metrics-server started on {}", &args.metrics_address);
+    let metrics_addr = metricserver::start(&args.metrics_address, None).unwrap();
+    log::info!("metrics-server started on {}", metrics_addr);
 
     let nc = nats_util::prepare_connection(&args.nats)
         .expect("should be able to open a password file")

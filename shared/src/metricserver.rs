@@ -15,7 +15,10 @@ const LOG_TARGET: &str = "metricserver";
 // This is a minimal, per request thread spawning, and incorrect HTTP server
 // which answers on all request methods with prometheus formatted metrics.
 
-pub fn start(prometheus_address: &str, registry: Option<Registry>) -> Result<(), io::Error> {
+pub fn start(
+    prometheus_address: &str,
+    registry: Option<Registry>,
+) -> Result<std::net::SocketAddr, io::Error> {
     let listener = TcpListener::bind(prometheus_address)?;
     let local_addr = listener.local_addr()?;
     log::info!(
@@ -42,7 +45,7 @@ pub fn start(prometheus_address: &str, registry: Option<Registry>) -> Result<(),
             };
         }
     });
-    Ok(())
+    Ok(local_addr)
 }
 
 fn handle_request(

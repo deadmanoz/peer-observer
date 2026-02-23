@@ -24,6 +24,7 @@ use shared::protobuf::{
     p2p_extractor::p2p,
     rpc_extractor::{rpc, Addrman, AddrmanBucket},
 };
+use shared::tokio::sync::oneshot;
 use shared::tokio::sync::watch;
 use shared::util::{self, is_on_linkinglion_banlist};
 use shared::{async_nats, clap};
@@ -82,18 +83,26 @@ struct State {
 pub async fn run(
     args: Args,
     mut shutdown_rx: watch::Receiver<bool>,
+    bound_addr_tx: Option<oneshot::Sender<std::net::SocketAddr>>,
 ) -> Result<(), error::RuntimeError> {
     info!(target: LOG_TARGET, "Starting metrics-server...",);
 
     let metrics = metrics::Metrics::new();
 
-    metricserver::start(&args.metrics_address, Some(metrics.registry.clone()))?;
+    let local_addr = metricserver::start(&args.metrics_address, Some(metrics.registry.clone()))?;
 
     let nc = nats_util::prepare_connection(&args.nats)?
         .connect(&args.nats.address)
         .await?;
     info!("Connected to NATS-server at {}", args.nats.address);
     let mut sub = nc.subscribe("*").await?;
+
+    // Notify the caller of the actual bound address only after the NATS
+    // subscription is ready.  This ensures that any events published after
+    // receiving the address will be picked up by the subscription.
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(local_addr);
+    }
 
     metrics
         .runtime_start_timestamp
