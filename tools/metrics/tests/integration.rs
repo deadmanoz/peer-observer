@@ -36,7 +36,10 @@ use shared::{
     simple_logger::SimpleLogger,
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{
-        self, select,
+        self,
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+        select,
         sync::{oneshot, watch},
         time::sleep,
     },
@@ -45,13 +48,19 @@ use shared::{
 
 use std::{
     collections::HashMap,
-    io::{Read, Write},
-    net::TcpStream,
-    sync::Once,
+    sync::{LazyLock, Once},
     time::Duration,
 };
 
 static INIT: Once = Once::new();
+
+/// Limit concurrent test execution. Each test spawns its own nats-server
+/// process, an HTTP metrics server, and NATS client connections. Running all
+/// 55 tests simultaneously overwhelms the system — nats-server processes
+/// become unresponsive under CPU contention, causing events to never be
+/// delivered even with generous polling timeouts.
+static TEST_SEMAPHORE: LazyLock<shared::tokio::sync::Semaphore> =
+    LazyLock::new(|| shared::tokio::sync::Semaphore::new(2));
 
 fn setup() {
     INIT.call_once(|| {
@@ -75,43 +84,36 @@ fn make_test_args(nats_port: u16, metrics_port: u16) -> Args {
     )
 }
 
-fn fetch_metrics(port: u16) -> Result<String, std::io::Error> {
+async fn fetch_metrics(port: u16) -> Result<String, std::io::Error> {
     let addr = format!("127.0.0.1:{}", port);
     debug!("fetching metrics from {}", addr);
-    let mut stream = TcpStream::connect(addr.clone())?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr.clone()))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
         addr
     );
 
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush()?;
+    tokio::time::timeout(Duration::from_secs(5), stream.write_all(request.as_bytes()))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
+    tokio::time::timeout(Duration::from_secs(5), stream.flush())
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     // Read the full response until EOF (server closes the connection).
     let mut response = Vec::new();
-    let mut s = stream;
-    s.read_to_end(&mut response)?;
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     Ok(String::from_utf8_lossy(&response).to_string())
 }
 
-fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Error> {
-    let metrics_raw = fetch_metrics(port)?;
-
-    println!("HTTP response from metrics server:\n");
-    for line in metrics_raw.split("\n") {
-        println!("{}", line);
-    }
-
-    println!("Only metrics (no help text):\n");
-    for line in metrics_raw.split("\n") {
-        if !line.starts_with("# ") {
-            println!("{}", line);
-        }
-    }
+async fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Error> {
+    let metrics_raw = fetch_metrics(port).await?;
 
     let mut no_lines_missing = true;
     for line in expected {
@@ -120,7 +122,7 @@ fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Error> {
             continue;
         }
         if !metrics_raw.contains(line) {
-            println!("Response does not contain line: '{}'", line);
+            debug!("response does not contain line: '{}'", line);
             no_lines_missing = false;
         }
     }
@@ -130,6 +132,7 @@ fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Error> {
 async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     setup();
 
+    let _permit = TEST_SEMAPHORE.acquire().await.expect("semaphore closed");
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
 
@@ -162,16 +165,63 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
             .await;
     }
 
-    sleep(Duration::from_millis(100)).await;
+    // Flush guarantees the NATS server has received all published messages
+    // (PING/PONG round-trip). Without this, `publish()` only queues the
+    // message in the client buffer — the server may not have forwarded it
+    // to subscribers yet.
+    nats_publisher.flush().await;
 
     let expected_lines: Vec<&str> = expected.split('\n').collect();
-    assert!(check_metrics(metrics_port, &expected_lines).expect("Could not fetch metrics"));
+
+    // Poll until the metrics tool has processed the published events.
+    // The NATS pub/sub pipeline has variable latency (server forwarding,
+    // subscriber processing, Prometheus registry update), so a fixed sleep
+    // is inherently racy. Instead we retry with short intervals.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+
+        if metrics_handle.is_finished() {
+            // Surface the real task failure instead of timing out on stale metrics.
+            metrics_handle
+                .await
+                .expect("metrics task should not panic before convergence");
+            panic!("metrics task exited before metrics convergence");
+        }
+
+        match check_metrics(metrics_port, &expected_lines).await {
+            Ok(true) => break,
+            Ok(false) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(50)).await;
+            }
+            Ok(false) => {
+                let metrics_raw = fetch_metrics(metrics_port)
+                    .await
+                    .unwrap_or_else(|e| format!("failed to fetch metrics on final attempt: {e}"));
+                panic!(
+                    "Metrics did not converge within timeout after {attempts} attempts. \
+                     Expected lines:\n{expected}\n\
+                     Final metrics response:\n{metrics_raw}",
+                );
+            }
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                debug!("check_metrics transient error (attempt {attempts}): {e}");
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                panic!(
+                    "Could not fetch metrics after {attempts} attempts: {e}",
+                );
+            }
+        }
+    }
 
     shutdown_tx.send(true).unwrap();
     metrics_handle.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_no_nats_connection() {
     println!("test that we fail if we can't connect to NATS (due to port 0)");
     setup();
@@ -191,7 +241,7 @@ async fn test_integration_metrics_no_nats_connection() {
     ))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_basic() {
     println!("test that we can connect to NATS and query from the metrics server");
 
@@ -203,7 +253,7 @@ async fn test_integration_metrics_basic() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_message_count() {
     println!("test that the P2P message count works");
 
@@ -249,7 +299,7 @@ async fn test_integration_metrics_p2p_message_count() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_traffic_linkinglion() {
     println!("test that the linkinglion traffic P2P metrics work");
 
@@ -299,7 +349,7 @@ async fn test_integration_metrics_p2p_traffic_linkinglion() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_addr() {
     println!("test that the P2P addr metrics work");
 
@@ -513,7 +563,7 @@ async fn test_integration_metrics_p2p_addr() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_addrv2() {
     println!("test that the P2P addrv2 metrics work");
 
@@ -719,7 +769,7 @@ async fn test_integration_metrics_p2p_addrv2() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_address_self_announcement() {
     println!("test that the P2P address self-announcement metric works");
 
@@ -805,7 +855,7 @@ async fn test_integration_metrics_p2p_address_self_announcement() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_address_subnet_announcement() {
     println!("test that the P2P address subnet-announcement metric works");
 
@@ -891,7 +941,7 @@ async fn test_integration_metrics_p2p_address_subnet_announcement() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_version() {
     println!("test that the P2P version metrics work");
 
@@ -991,7 +1041,7 @@ async fn test_integration_metrics_p2p_version() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_feefilter() {
     println!("test that the P2P feefilter metrics work");
 
@@ -1022,7 +1072,7 @@ async fn test_integration_metrics_p2p_feefilter() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_rejected() {
     println!("test that the P2P rejected metrics work");
 
@@ -1076,7 +1126,7 @@ async fn test_integration_metrics_p2p_rejected() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_inv() {
     println!("test that the P2P inv metrics work");
 
@@ -1195,7 +1245,7 @@ async fn test_integration_metrics_p2p_inv() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_inv_large_outbound() {
     println!("test that large outbound INV message (> 35) metrics work");
 
@@ -1278,7 +1328,7 @@ async fn test_integration_metrics_p2p_inv_large_outbound() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_oldping() {
     println!("test that the P2P oldping metrics work");
 
@@ -1307,7 +1357,7 @@ async fn test_integration_metrics_p2p_oldping() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_ping_value() {
     println!("test that the P2P ping value metrics work");
 
@@ -1361,7 +1411,7 @@ async fn test_integration_metrics_p2p_ping_value() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2p_empty_addrv2() {
     println!("test that the P2P emptyaddrv2 metrics work");
 
@@ -1390,7 +1440,7 @@ async fn test_integration_metrics_p2p_empty_addrv2() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_inbound() {
     println!("test that the inbound connection metrics work");
 
@@ -1421,7 +1471,7 @@ async fn test_integration_metrics_conn_inbound() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_outbound() {
     println!("test that the outbound connection metrics work");
 
@@ -1453,7 +1503,7 @@ async fn test_integration_metrics_conn_outbound() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_closed() {
     println!("test that the closed connection metrics work");
 
@@ -1486,7 +1536,7 @@ async fn test_integration_metrics_conn_closed() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_inbound_evicted() {
     println!("test that the inbound_evicted connection metrics work");
 
@@ -1517,7 +1567,7 @@ async fn test_integration_metrics_conn_inbound_evicted() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_misbehaving() {
     println!("test that the misbehaving connection metrics work");
 
@@ -1542,7 +1592,7 @@ async fn test_integration_metrics_conn_misbehaving() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_special_ip() {
     println!("test that the metrics for special IPs work");
 
@@ -1613,7 +1663,7 @@ async fn test_integration_metrics_conn_special_ip() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_conn_private_transaction_broadcast() {
     println!("test that the private_transaction_broadcast connection metrics work");
 
@@ -1660,7 +1710,7 @@ async fn test_integration_metrics_conn_private_transaction_broadcast() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_validation() {
     println!("test that validation metrics work");
 
@@ -1693,7 +1743,7 @@ async fn test_integration_metrics_validation() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_mempool_added() {
     println!("test that the mempool added metrics work");
 
@@ -1717,7 +1767,7 @@ async fn test_integration_metrics_mempool_added() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_mempool_added_mass() {
     println!("test that the mempool added metrics work when we add a lot of events");
 
@@ -1747,7 +1797,7 @@ async fn test_integration_metrics_mempool_added_mass() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_mempool_replaced() {
     println!("test that the mempool replaced metrics work");
 
@@ -1776,7 +1826,7 @@ async fn test_integration_metrics_mempool_replaced() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_mempool_rejected() {
     println!("test that the mempool rejected metrics work");
 
@@ -1809,7 +1859,7 @@ async fn test_integration_metrics_mempool_rejected() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_mempool_removed() {
     println!("test that the mempool removed metrics work");
 
@@ -1849,7 +1899,7 @@ async fn test_integration_metrics_mempool_removed() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo() {
     println!("test that the RPC peer-info metrics work");
 
@@ -2025,7 +2075,7 @@ async fn test_integration_metrics_rpc_peerinfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_addrman() {
     println!("test that the addrman metrics work");
 
@@ -2068,7 +2118,7 @@ async fn test_integration_metrics_addrman() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo_sub1satvbyte() {
     println!("test that the sub-1 sat/vbyte peers metric works");
 
@@ -2223,7 +2273,7 @@ async fn test_integration_metrics_rpc_peerinfo_sub1satvbyte() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo_invtosend() {
     println!("test that the invtosend metrics work");
 
@@ -2377,7 +2427,7 @@ async fn test_integration_metrics_rpc_peerinfo_invtosend() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo_cpuload() {
     println!("test that the cpuload metrics work");
 
@@ -2531,7 +2581,7 @@ async fn test_integration_metrics_rpc_peerinfo_cpuload() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo_ipv4_inbound_diversity() {
     println!("test that the ipv4 inbound diversity metric works");
 
@@ -2679,7 +2729,7 @@ async fn test_integration_metrics_rpc_peerinfo_ipv4_inbound_diversity() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_peerinfo_peer_list_bitprojects() {
     println!("test that the bitprojects in/outbound peers metric works");
 
@@ -2828,7 +2878,7 @@ async fn test_integration_metrics_rpc_peerinfo_peer_list_bitprojects() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_uptime() {
     println!("test that the uptime metric works");
 
@@ -2847,7 +2897,7 @@ async fn test_integration_metrics_rpc_uptime() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getnettotals() {
     println!("test that the getnettotal metrics work");
 
@@ -2880,7 +2930,7 @@ async fn test_integration_metrics_rpc_getnettotals() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getmemoryinfo() {
     println!("test that the getmemoryinfo metrics work");
 
@@ -2911,7 +2961,7 @@ async fn test_integration_metrics_rpc_getmemoryinfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_mempoolinfo() {
     println!("test that the mempoolinfo metrics work");
 
@@ -2950,7 +3000,7 @@ async fn test_integration_metrics_rpc_mempoolinfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getaddrmaninfo() {
     println!("test that the addrmaninfo metrics work");
 
@@ -2994,7 +3044,7 @@ async fn test_integration_metrics_rpc_getaddrmaninfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_chaintxstats() {
     println!("test that the chaintxstats metrics work");
 
@@ -3030,7 +3080,7 @@ async fn test_integration_metrics_rpc_chaintxstats() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getrawaddrman() {
     println!("test that the getrawaddrman metrics work");
 
@@ -3097,7 +3147,7 @@ async fn test_integration_metrics_rpc_getrawaddrman() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getrawaddrman_changes() {
     println!("test that the getrawaddrman changes (delta between curr and prev) metrics work");
 
@@ -3202,7 +3252,7 @@ async fn test_integration_metrics_rpc_getrawaddrman_changes() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2pextractor_ping_duration() {
     println!("test that p2p-extractor ping duration metrics work");
 
@@ -3223,7 +3273,7 @@ async fn test_integration_metrics_p2pextractor_ping_duration() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2pextractor_address_annoucement() {
     println!("test that p2p-extractor address annoucement metrics work");
 
@@ -3267,7 +3317,7 @@ async fn test_integration_metrics_p2pextractor_address_annoucement() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2pextractor_inv_annoucement() {
     println!("test that p2p-extractor inventory annoucement metrics work");
 
@@ -3300,7 +3350,7 @@ async fn test_integration_metrics_p2pextractor_inv_annoucement() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_p2pextractor_feefilter_annoucement() {
     println!("test that p2p-extractor feefilter annoucement metrics work");
 
@@ -3324,7 +3374,7 @@ async fn test_integration_metrics_p2pextractor_feefilter_annoucement() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_logextractor_logevents() {
     println!("test that log-extractor log events metric work");
 
@@ -3361,7 +3411,7 @@ async fn test_integration_metrics_logextractor_logevents() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_logextractor_blockconnected_events() {
     println!("test that log-extractor block connected log events metric work");
 
@@ -3417,7 +3467,7 @@ async fn test_integration_metrics_logextractor_blockconnected_events() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_logextractor_blockchecked_events() {
     println!("test that log-extractor block checked log events metric work");
 
@@ -3448,7 +3498,7 @@ async fn test_integration_metrics_logextractor_blockchecked_events() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_logextractor_blockchecked_mutated_events() {
     println!("test that log-extractor block checked mutated block events metric work");
 
@@ -3479,7 +3529,7 @@ async fn test_integration_metrics_logextractor_blockchecked_mutated_events() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getnetworkinfo() {
     println!("test that the getnetworkinfo metrics work");
 
@@ -3544,7 +3594,7 @@ async fn test_integration_metrics_rpc_getnetworkinfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getblockchaininfo() {
     println!("test that the getblockchaininfo metrics work");
 
@@ -3594,7 +3644,7 @@ async fn test_integration_metrics_rpc_getblockchaininfo() {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_integration_metrics_rpc_getorphantxs() {
     println!("test that the getorphantxs metrics work");
 

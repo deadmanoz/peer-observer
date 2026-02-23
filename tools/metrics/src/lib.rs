@@ -96,10 +96,12 @@ pub async fn run(
         .await?;
     info!("Connected to NATS-server at {}", args.nats.address);
     let mut sub = nc.subscribe("*").await?;
+    // Flush guarantees the server has processed our SUB command, so any
+    // events published after this point will be delivered to us.
+    nc.flush().await?;
 
     // Notify the caller of the actual bound address only after the NATS
-    // subscription is ready.  This ensures that any events published after
-    // receiving the address will be picked up by the subscription.
+    // subscription is confirmed server-side.
     if let Some(tx) = bound_addr_tx {
         let _ = tx.send(local_addr);
     }

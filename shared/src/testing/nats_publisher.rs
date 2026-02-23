@@ -19,4 +19,13 @@ impl NatsPublisherForTesting {
             .await
             .expect("should be able to publish");
     }
+
+    /// Flush the NATS client connection, ensuring all published messages have
+    /// been received by the server (PING/PONG round-trip).
+    pub async fn flush(&self) {
+        self.client
+            .flush()
+            .await
+            .expect("should be able to flush NATS client");
+    }
 }
