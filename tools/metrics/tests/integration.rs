@@ -210,9 +210,7 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
                 sleep(Duration::from_millis(50)).await;
             }
             Err(e) => {
-                panic!(
-                    "Could not fetch metrics after {attempts} attempts: {e}",
-                );
+                panic!("Could not fetch metrics after {attempts} attempts: {e}",);
             }
         }
     }
