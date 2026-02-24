@@ -39,7 +39,7 @@ use shared::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream as TokioTcpStream,
-        sync::{oneshot, watch, OnceCell},
+        sync::{oneshot, watch},
         time::sleep,
     },
     util::current_timestamp,
@@ -53,7 +53,7 @@ use std::{
     sync::mpsc,
     sync::{
         atomic::{AtomicU64, Ordering},
-        LazyLock, Once,
+        Arc, LazyLock, Mutex, Once, OnceLock, Weak,
     },
     thread,
     time::Duration,
@@ -61,10 +61,24 @@ use std::{
 };
 
 static INIT: Once = Once::new();
-static SHARED_NATS_PORT: OnceCell<u16> = OnceCell::const_new();
 static TEST_SUBJECT_SEQ: AtomicU64 = AtomicU64::new(1);
 static TEST_SEMAPHORE: LazyLock<shared::tokio::sync::Semaphore> =
     LazyLock::new(|| shared::tokio::sync::Semaphore::new(2));
+static SHARED_NATS: OnceLock<Mutex<Weak<SharedNatsServer>>> = OnceLock::new();
+
+struct SharedNatsServer {
+    port: u16,
+    child: Mutex<Option<std::process::Child>>,
+}
+
+impl Drop for SharedNatsServer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.lock().expect("shared nats child mutex").take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn setup() {
     INIT.call_once(|| {
@@ -89,13 +103,23 @@ fn make_test_args(nats_port: u16, metrics_port: u16, nats_subject: String) -> Ar
     )
 }
 
-async fn shared_nats_port() -> u16 {
-    *SHARED_NATS_PORT
-        .get_or_init(|| async { spawn_shared_nats_server() })
-        .await
+fn shared_nats_server() -> Arc<SharedNatsServer> {
+    let weak_slot = SHARED_NATS.get_or_init(|| Mutex::new(Weak::new()));
+    let mut weak_guard = weak_slot.lock().expect("shared nats weak mutex");
+    if let Some(existing) = weak_guard.upgrade() {
+        return existing;
+    }
+
+    let (port, child) = spawn_shared_nats_server();
+    let server = Arc::new(SharedNatsServer {
+        port,
+        child: Mutex::new(Some(child)),
+    });
+    *weak_guard = Arc::downgrade(&server);
+    server
 }
 
-fn spawn_shared_nats_server() -> u16 {
+fn spawn_shared_nats_server() -> (u16, std::process::Child) {
     let nats_server_binary_path: String = match env::var("NATS_SERVER_BINARY") {
         Ok(b) => b,
         Err(e) => panic!(
@@ -127,8 +151,7 @@ fn spawn_shared_nats_server() -> u16 {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if TcpStream::connect(&addr).is_ok() {
-                Box::leak(Box::new(child));
-                return port;
+                return (port, child);
             }
             if child.try_wait().expect("try_wait should succeed").is_some() {
                 break;
@@ -195,7 +218,8 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     setup();
     let _permit = TEST_SEMAPHORE.acquire().await.expect("semaphore closed");
 
-    let nats_port = shared_nats_port().await;
+    let _shared_nats = shared_nats_server();
+    let nats_port = _shared_nats.port;
     let nats_publisher = NatsPublisherForTesting::new(nats_port).await;
     let subject_id = TEST_SUBJECT_SEQ.fetch_add(1, Ordering::Relaxed);
     let nats_subject = format!("{}.{}", subject, subject_id);
