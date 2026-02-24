@@ -22,6 +22,7 @@ use shared::{
         time::{Duration, sleep},
     },
 };
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::Once;
 
@@ -37,6 +38,57 @@ fn setup() {
             .init()
             .unwrap();
     });
+}
+
+/// Appends a marker line to `debug.log` with a valid RFC 3339 timestamp so the
+/// log parser treats it as an `UnknownLogMessage`.
+fn write_marker(log_path: &str, marker: &str) {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(log_path)
+        .expect("failed to open debug.log for appending");
+    writeln!(file, "2026-01-01T00:00:00Z {marker}").expect("failed to write marker");
+}
+
+/// Waits until `marker` arrives via NATS as an `UnknownLogMessage`, proving the
+/// full debug.log -> tail -> pipe -> extractor -> NATS pipeline is live.
+/// Returns any `PeerObserverEvent`s consumed before the marker so callers can
+/// replay them through their assertion logic (prevents event starvation).
+/// Panics on timeout.
+async fn wait_for_marker(
+    sub: &mut shared::async_nats::Subscriber,
+    marker: &str,
+    timeout: Duration,
+) -> Vec<PeerObserverEvent> {
+    let mut buffered = Vec::new();
+    let mut marker_seen = false;
+    select! {
+        _ = sleep(timeout) => {
+            panic!("timed out waiting for pipeline-ready marker '{marker}'");
+        }
+        _ = async {
+            while let Some(msg) = sub.next().await {
+                if let Ok(event) = Event::decode(msg.payload) {
+                    if let Some(PeerObserverEvent::LogExtractor(ref r)) = event.peer_observer_event
+                        && let Some(log::LogEvent::UnknownLogMessage(ref u)) = r.log_event
+                        && u.raw_message.contains(marker)
+                    {
+                        info!("received pipeline-ready marker: {marker}");
+                        marker_seen = true;
+                        return;
+                    }
+                    if let Some(pe) = event.peer_observer_event {
+                        buffered.push(pe);
+                    }
+                }
+            }
+        } => {}
+    }
+    assert!(
+        marker_seen,
+        "NATS subscription stream closed before pipeline-ready marker '{marker}' arrived"
+    );
+    buffered
 }
 
 /// Bridges Bitcoin Core's `debug.log` into a named pipe for the log extractor.
@@ -122,18 +174,23 @@ fn setup_two_connected_nodes(node1_args: Vec<&str>) -> (corepc_node::Node, corep
 /// 1. Initializes logging and spins up two connected regtest nodes (node1
 ///    accepts inbound P2P; node2 connects to it). `args` are passed as extra
 ///    bitcoind CLI flags to node1 (e.g. `-debug=validation`).
-/// 2. Starts a throwaway NATS server and launches the log extractor, which
-///    reads node1's `debug.log` via a named pipe (`mkfifo` + `tail -f`) and
-///    publishes protobuf-encoded events to NATS.
-/// 3. Calls `test_setup` against node1's RPC client so the test can trigger
+/// 2. Starts a throwaway NATS server and subscribes *before* launching the
+///    extractor, so startup events are not lost.
+/// 3. Launches the log extractor, which reads node1's `debug.log` via a named
+///    pipe (`mkfifo` + `tail -f`) and publishes protobuf-encoded events to
+///    NATS.
+/// 4. Performs an end-to-end pipeline handshake: writes a unique marker line
+///    into `debug.log` and waits for it to arrive via NATS, buffering any
+///    events consumed before the marker. This proves the full
+///    `debug.log -> tail -> pipe -> extractor -> NATS` path is live.
+/// 5. Calls `test_setup` against node1's RPC client so the test can trigger
 ///    the specific node behaviour it wants to observe (mine a block, submit a
 ///    transaction, etc.).
-/// 4. Subscribes to all NATS subjects and polls incoming messages, decoding
-///    each into a `PeerObserverEvent` and passing it to `check_event`. The
-///    loop breaks as soon as `check_event` returns `true`, signalling that the
-///    expected event was received.
-/// 5. Panics if the expected event is not seen within `TEST_TIMEOUT_SECONDS`.
-/// 6. Sends a shutdown signal to the log extractor task and awaits its clean
+/// 6. Replays buffered pre-marker events through `check_event`, then polls
+///    live NATS messages. The loop breaks as soon as `check_event` returns
+///    `true`.
+/// 7. Panics if the expected event is not seen within `TEST_TIMEOUT_SECONDS`.
+/// 8. Sends a shutdown signal to the log extractor task and awaits its clean
 ///    exit before returning.
 async fn check(
     args: Vec<&str>,
@@ -143,25 +200,43 @@ async fn check(
     setup();
     let (node1, _node2) = setup_two_connected_nodes(args);
     let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_port = nats_server.port;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Subscribe BEFORE spawning the extractor so that startup events
+    // published between extractor start and subscription are not lost.
+    // Without this, tests with no-op test_setup() starve because the
+    // only events they could ever match were already published.
+    let nc = async_nats::connect(format!("127.0.0.1:{}", nats_port))
+        .await
+        .unwrap();
+    let mut sub = nc.subscribe("*").await.unwrap();
+
     let node1_workdir = node1.workdir().to_str().unwrap().to_string();
+    let log_path = format!("{}/regtest/debug.log", node1_workdir);
+    let log_path_main = log_path.clone();
     let log_extractor_handle = tokio::spawn(async move {
-        let log_path = format!("{}/regtest/debug.log", node1_workdir);
         let pipe_path = format!("{}/bitcoind_pipe", node1_workdir);
         spawn_pipe(log_path, pipe_path.clone());
 
-        let args = make_test_args(nats_server.port, pipe_path.to_string());
+        let args = make_test_args(nats_port, pipe_path.to_string());
 
         log_extractor::run(args, shutdown_rx.clone())
             .await
             .expect("log extractor failed");
     });
 
-    let nc = async_nats::connect(format!("127.0.0.1:{}", nats_server.port))
-        .await
-        .unwrap();
-    let mut sub = nc.subscribe("*").await.unwrap();
+    // End-to-end pipeline handshake: write a unique marker into debug.log
+    // and wait for it to arrive via NATS, proving the full
+    // debug.log -> tail -> pipe -> extractor -> NATS path is live.
+    // Events consumed before the marker are buffered for replay.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let marker = format!("PIPELINE_READY:{nanos}");
+    write_marker(&log_path_main, &marker);
+    let buffered = wait_for_marker(&mut sub, &marker, Duration::from_secs(10)).await;
 
     test_setup(&node1.client);
 
@@ -171,7 +246,15 @@ async fn check(
         _ = sleep(Duration::from_secs(TEST_TIMEOUT_SECONDS)) => {
             panic!("timed out waiting for check() to complete");
         }
-        _ = async { while let Some(msg) = sub.next().await {
+        _ = async {
+            // Replay events consumed during the marker handshake so tests
+            // that rely on early/startup events are not starved.
+            for event in buffered {
+                if check_event(event) {
+                    return;
+                }
+            }
+            while let Some(msg) = sub.next().await {
                 let unwrapped = Event::decode(msg.payload).unwrap();
                 if let Some(event) = unwrapped.peer_observer_event
                     && check_event(event)
