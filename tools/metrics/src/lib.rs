@@ -131,20 +131,16 @@ pub async fn run(
 
         let deadline = shared::tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let maybe_msg = match shared::tokio::time::timeout(
-                Duration::from_millis(200),
-                sub.next(),
-            )
-            .await
-            {
-                Ok(msg) => msg,
-                Err(_) => {
-                    if shared::tokio::time::Instant::now() >= deadline {
-                        panic!("did not receive metrics readiness marker in time");
+            let maybe_msg =
+                match shared::tokio::time::timeout(Duration::from_millis(200), sub.next()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        if shared::tokio::time::Instant::now() >= deadline {
+                            panic!("did not receive metrics readiness marker in time");
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
+                };
             if let Some(msg) = maybe_msg {
                 if msg.payload.as_ref() == ready_marker.as_slice() {
                     break;
