@@ -34,13 +34,12 @@ use shared::{
         },
     },
     simple_logger::SimpleLogger,
-    testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
+    testing::nats_publisher::NatsPublisherForTesting,
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-        select,
-        sync::{oneshot, watch},
+        net::TcpStream as TokioTcpStream,
+        sync::{oneshot, watch, OnceCell},
         time::sleep,
     },
     util::current_timestamp,
@@ -48,30 +47,36 @@ use shared::{
 
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Once},
+    env,
+    net::TcpStream,
+    process::{Command, Stdio},
+    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        LazyLock,
+        Once,
+    },
+    thread,
+    time::Instant,
     time::Duration,
 };
 
 static INIT: Once = Once::new();
-
-/// Limit concurrent test execution. Each test spawns its own nats-server
-/// process, an HTTP metrics server, and NATS client connections. Running all
-/// 55 tests simultaneously overwhelms the system — nats-server processes
-/// become unresponsive under CPU contention, causing events to never be
-/// delivered even with generous polling timeouts.
+static SHARED_NATS_PORT: OnceCell<u16> = OnceCell::const_new();
+static TEST_SUBJECT_SEQ: AtomicU64 = AtomicU64::new(1);
 static TEST_SEMAPHORE: LazyLock<shared::tokio::sync::Semaphore> =
     LazyLock::new(|| shared::tokio::sync::Semaphore::new(2));
 
 fn setup() {
     INIT.call_once(|| {
         SimpleLogger::new()
-            .with_level(LevelFilter::Trace)
+            .with_level(LevelFilter::Error)
             .init()
             .unwrap();
     });
 }
 
-fn make_test_args(nats_port: u16, metrics_port: u16) -> Args {
+fn make_test_args(nats_port: u16, metrics_port: u16, nats_subject: String) -> Args {
     Args::new(
         NatsArgs {
             address: format!("127.0.0.1:{}", nats_port),
@@ -80,16 +85,76 @@ fn make_test_args(nats_port: u16, metrics_port: u16) -> Args {
             password_file: None,
         },
         format!("127.0.0.1:{}", metrics_port),
-        Level::Trace,
+        Level::Error,
+        nats_subject,
     )
+}
+
+async fn shared_nats_port() -> u16 {
+    *SHARED_NATS_PORT
+        .get_or_init(|| async { spawn_shared_nats_server() })
+        .await
+}
+
+fn spawn_shared_nats_server() -> u16 {
+    let nats_server_binary_path: String = match env::var("NATS_SERVER_BINARY") {
+        Ok(b) => b,
+        Err(e) => panic!(
+            "Set NATS_SERVER_BINARY to the nats-server binary path for integration tests: {}",
+            e
+        ),
+    };
+
+    for _attempt in 1..=20 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("should be able to reserve ephemeral TCP port");
+        let port = listener
+            .local_addr()
+            .expect("listener should have local address")
+            .port();
+        drop(listener);
+
+        let mut child = match Command::new(&nats_server_binary_path)
+            .args([format!("--port={port}"), "--addr=127.0.0.1".to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let addr = format!("127.0.0.1:{port}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if TcpStream::connect(&addr).is_ok() {
+                Box::leak(Box::new(child));
+                return port;
+            }
+            if child
+                .try_wait()
+                .expect("try_wait should succeed")
+                .is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    panic!("Could not spawn shared NATS server for integration tests")
 }
 
 async fn fetch_metrics(port: u16) -> Result<String, std::io::Error> {
     let addr = format!("127.0.0.1:{}", port);
     debug!("fetching metrics from {}", addr);
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr.clone()))
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(5), TokioTcpStream::connect(addr.clone()))
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -131,37 +196,42 @@ async fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Er
 
 async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     setup();
-
     let _permit = TEST_SEMAPHORE.acquire().await.expect("semaphore closed");
-    let nats_server = NatsServerForTesting::new(&[]).await;
-    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+
+    let nats_port = shared_nats_port().await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_port).await;
+    let subject_id = TEST_SUBJECT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nats_subject = format!("{}.{}", subject, subject_id);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (addr_tx, addr_rx) = oneshot::channel();
+    let (metrics_done_tx, metrics_done_rx) = mpsc::channel::<Result<(), String>>();
 
-    let mut metrics_handle = tokio::spawn(async move {
-        let args = make_test_args(nats_server.port, 0);
-        metrics::run(args, shutdown_rx.clone(), Some(addr_tx))
-            .await
-            .expect("metrics tool failed");
+    let nats_subject_for_metrics = nats_subject.clone();
+    let metrics_thread = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("metrics runtime should build");
+        let args = make_test_args(nats_port, 0, nats_subject_for_metrics);
+        let result = rt
+            .block_on(async { metrics::run(args, shutdown_rx.clone(), Some(addr_tx)).await })
+            .map_err(|e| e.to_string());
+        let _ = metrics_done_tx.send(result);
     });
 
     // Wait for the metrics tool to bind and report its actual port.
-    // We race against the task handle so that if the tool fails
-    // before binding (e.g. NATS connection error), we surface the
-    // real error instead of a generic "channel closed" panic.
-    let metrics_port = select! {
-        addr = addr_rx => addr.expect("metrics tool should send bound address").port(),
-        result = &mut metrics_handle => {
-            result.unwrap();  // propagates the task's panic (with its message)
-            unreachable!("metrics task exited before sending bound address");
-        }
-    };
+    let metrics_port = addr_rx
+        .await
+        .expect("metrics tool should send bound address")
+        .port();
 
-    for event in events {
-        debug!("publishing: {:?}", event);
+    let payloads: Vec<Vec<u8>> = events.iter().map(|event| event.encode_to_vec()).collect();
+    for (i, payload) in payloads.iter().enumerate() {
+        debug!("publishing payload {}", i + 1);
         nats_publisher
-            .publish(subject.to_string(), event.encode_to_vec())
+            .publish(nats_subject.clone(), payload.clone())
             .await;
     }
 
@@ -182,12 +252,14 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     loop {
         attempts += 1;
 
-        if metrics_handle.is_finished() {
-            // Surface the real task failure instead of timing out on stale metrics.
-            metrics_handle
-                .await
-                .expect("metrics task should not panic before convergence");
-            panic!("metrics task exited before metrics convergence");
+        match metrics_done_rx.try_recv() {
+            Ok(result) => {
+                panic!("metrics task exited before metrics convergence: {result:?}");
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("metrics task thread terminated unexpectedly before convergence");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
 
         match check_metrics(metrics_port, &expected_lines).await {
@@ -216,7 +288,12 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     }
 
     shutdown_tx.send(true).unwrap();
-    metrics_handle.await.unwrap();
+    match metrics_done_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("metrics task failed during shutdown: {e}"),
+        Err(e) => panic!("metrics task did not report shutdown result: {e}"),
+    }
+    metrics_thread.join().expect("metrics thread should join cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -224,7 +301,7 @@ async fn test_integration_metrics_no_nats_connection() {
     println!("test that we fail if we can't connect to NATS (due to port 0)");
     setup();
 
-    let args = make_test_args(0, 0);
+    let args = make_test_args(0, 0, "*".to_string());
     let (_, shutdown_rx) = watch::channel(false);
     let result = metrics::run(args, shutdown_rx, None).await;
 

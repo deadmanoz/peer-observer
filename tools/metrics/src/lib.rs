@@ -31,6 +31,7 @@ use shared::{async_nats, clap};
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub mod error;
 mod metrics;
@@ -57,14 +58,25 @@ pub struct Args {
     /// are "trace", "debug", "info", "warn", "error". See https://docs.rs/log/latest/log/enum.Level.html
     #[arg(short, long, default_value_t = Level::Debug)]
     pub log_level: Level,
+
+    /// NATS subject to subscribe to.
+    /// Defaults to '*' to keep current behavior.
+    #[arg(long, default_value = "*")]
+    pub nats_subject: String,
 }
 
 impl Args {
-    pub fn new(nats: NatsArgs, metrics_address: String, log_level: Level) -> Self {
+    pub fn new(
+        nats: NatsArgs,
+        metrics_address: String,
+        log_level: Level,
+        nats_subject: String,
+    ) -> Self {
         Self {
             nats,
             metrics_address,
             log_level,
+            nats_subject,
         }
     }
 }
@@ -91,21 +103,58 @@ pub async fn run(
 
     let local_addr = metricserver::start(&args.metrics_address, Some(metrics.registry.clone()))?;
 
-    let nc = nats_util::prepare_connection(&args.nats)?
-        .connect(&args.nats.address)
-        .await?;
+    let mut connect_options = nats_util::prepare_connection(&args.nats)?;
+    #[cfg(feature = "nats_integration_tests")]
+    {
+        // Tests can create heavy short-lived bursts.
+        connect_options = connect_options.subscription_capacity(1024 * 1024);
+    }
+
+    let nc = connect_options.connect(&args.nats.address).await?;
     info!("Connected to NATS-server at {}", args.nats.address);
-    let mut sub = nc.subscribe("*").await?;
+    let mut sub = nc.subscribe(args.nats_subject.clone()).await?;
     // Flush guarantees the server has processed our SUB command, so any
     // events published after this point will be delivered to us.
     nc.flush().await?;
+
+    #[cfg(feature = "nats_integration_tests")]
+    {
+        // Validate end-to-end delivery for this exact subscription before
+        // signaling test readiness.
+        let ready_marker = format!("__metrics_ready__{}", util::current_timestamp()).into_bytes();
+        nc.publish(args.nats_subject.clone(), ready_marker.clone().into())
+            .await
+            .expect("metrics readiness publish should succeed");
+        nc.flush()
+            .await
+            .expect("metrics readiness flush should succeed");
+
+        let deadline = shared::tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let maybe_msg = shared::tokio::time::timeout(Duration::from_millis(200), sub.next())
+                .await
+                .expect("timed out waiting for metrics readiness marker");
+            if let Some(msg) = maybe_msg {
+                if msg.payload.as_ref() == ready_marker.as_slice() {
+                    break;
+                }
+                // Ignore non-marker messages that may arrive in unusual
+                // ordering scenarios prior to test readiness.
+            } else {
+                panic!("subscription ended before metrics readiness marker");
+            }
+
+            if shared::tokio::time::Instant::now() >= deadline {
+                panic!("did not receive metrics readiness marker in time");
+            }
+        }
+    }
 
     // Notify the caller of the actual bound address only after the NATS
     // subscription is confirmed server-side.
     if let Some(tx) = bound_addr_tx {
         let _ = tx.send(local_addr);
     }
-
     metrics
         .runtime_start_timestamp
         .set(util::current_timestamp() as i64);
