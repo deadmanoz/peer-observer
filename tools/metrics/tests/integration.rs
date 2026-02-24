@@ -53,12 +53,11 @@ use std::{
     sync::mpsc,
     sync::{
         atomic::{AtomicU64, Ordering},
-        LazyLock,
-        Once,
+        LazyLock, Once,
     },
     thread,
-    time::Instant,
     time::Duration,
+    time::Instant,
 };
 
 static INIT: Once = Once::new();
@@ -131,11 +130,7 @@ fn spawn_shared_nats_server() -> u16 {
                 Box::leak(Box::new(child));
                 return port;
             }
-            if child
-                .try_wait()
-                .expect("try_wait should succeed")
-                .is_some()
-            {
+            if child.try_wait().expect("try_wait should succeed").is_some() {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -151,10 +146,12 @@ fn spawn_shared_nats_server() -> u16 {
 async fn fetch_metrics(port: u16) -> Result<String, std::io::Error> {
     let addr = format!("127.0.0.1:{}", port);
     debug!("fetching metrics from {}", addr);
-    let mut stream =
-        tokio::time::timeout(Duration::from_secs(5), TokioTcpStream::connect(addr.clone()))
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TokioTcpStream::connect(addr.clone()),
+    )
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
@@ -293,7 +290,9 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
         Ok(Err(e)) => panic!("metrics task failed during shutdown: {e}"),
         Err(e) => panic!("metrics task did not report shutdown result: {e}"),
     }
-    metrics_thread.join().expect("metrics thread should join cleanly");
+    metrics_thread
+        .join()
+        .expect("metrics thread should join cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
