@@ -107,7 +107,7 @@ pub async fn run(
     #[cfg(feature = "nats_integration_tests")]
     {
         // Tests can create heavy short-lived bursts.
-        connect_options = connect_options.subscription_capacity(1024 * 1024);
+        connect_options = connect_options.subscription_capacity(64 * 1024);
     }
 
     let nc = connect_options.connect(&args.nats.address).await?;
@@ -131,9 +131,20 @@ pub async fn run(
 
         let deadline = shared::tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let maybe_msg = shared::tokio::time::timeout(Duration::from_millis(200), sub.next())
-                .await
-                .expect("timed out waiting for metrics readiness marker");
+            let maybe_msg = match shared::tokio::time::timeout(
+                Duration::from_millis(200),
+                sub.next(),
+            )
+            .await
+            {
+                Ok(msg) => msg,
+                Err(_) => {
+                    if shared::tokio::time::Instant::now() >= deadline {
+                        panic!("did not receive metrics readiness marker in time");
+                    }
+                    continue;
+                }
+            };
             if let Some(msg) = maybe_msg {
                 if msg.payload.as_ref() == ready_marker.as_slice() {
                     break;

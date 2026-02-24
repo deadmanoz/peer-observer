@@ -39,7 +39,7 @@ use shared::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream as TokioTcpStream,
-        sync::{oneshot, watch},
+        sync::{oneshot, watch, Semaphore},
         time::sleep,
     },
     util::current_timestamp,
@@ -53,7 +53,7 @@ use std::{
     sync::mpsc,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, LazyLock, Mutex, Once, OnceLock, Weak,
+        Arc, Mutex, Once, OnceLock, Weak,
     },
     thread,
     time::Duration,
@@ -62,9 +62,8 @@ use std::{
 
 static INIT: Once = Once::new();
 static TEST_SUBJECT_SEQ: AtomicU64 = AtomicU64::new(1);
-static TEST_SEMAPHORE: LazyLock<shared::tokio::sync::Semaphore> =
-    LazyLock::new(|| shared::tokio::sync::Semaphore::new(2));
 static SHARED_NATS: OnceLock<Mutex<Weak<SharedNatsServer>>> = OnceLock::new();
+static TEST_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 struct SharedNatsServer {
     port: u16,
@@ -216,7 +215,11 @@ async fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Er
 
 async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
     setup();
-    let _permit = TEST_SEMAPHORE.acquire().await.expect("semaphore closed");
+    let _permit = TEST_SEMAPHORE
+        .get_or_init(|| Semaphore::new(2))
+        .acquire()
+        .await
+        .expect("test semaphore should acquire");
 
     let _shared_nats = shared_nats_server();
     let nats_port = _shared_nats.port;
@@ -230,8 +233,7 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
 
     let nats_subject_for_metrics = nats_subject.clone();
     let metrics_thread = thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("metrics runtime should build");
