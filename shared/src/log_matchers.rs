@@ -172,6 +172,17 @@ struct CommonLogData {
     pub message: String,
 }
 
+/// Returns `true` if `s` is a standalone Bitcoin Core log level bracket token.
+///
+/// Only `LogError()` and `LogWarning()` produce standalone bracket tokens
+/// (`[error]` and `[warning]`). Other Bitcoin Core log levels never appear as
+/// standalone brackets: `LogInfo()` emits no bracket at all, and
+/// `LogDebug()`/`LogTrace()` require a category argument so they produce
+/// `[category]` or `[category:trace]`, never standalone `[debug]` or `[trace]`.
+fn is_standalone_log_level(s: &str) -> bool {
+    matches!(s.to_lowercase().as_str(), "error" | "warning")
+}
+
 fn parse_common_log_data(line: &str) -> CommonLogData {
     let caps = LOG_LINE_REGEX.captures(line);
     if caps.is_none() {
@@ -200,6 +211,11 @@ fn parse_common_log_data(line: &str) -> CommonLogData {
         .captures_iter(metadata)
         .map(|cap| cap[1].to_string())
         .collect();
+
+    // Filter out log level markers. Bitcoin Core uses LogError(), LogWarning(),
+    // etc. which emit [error], [warning], etc. These are log LEVELS, not
+    // threadnames or debug categories.
+    metadata_items.retain(|item| !is_standalone_log_level(item));
 
     // if exists, category is usually the last metadata item
     let mut category = LogDebugCategory::Unknown;
@@ -449,5 +465,72 @@ mod tests {
             return;
         }
         panic!("Expected BlockCheckedLog event");
+    }
+
+    #[test]
+    fn test_log_matcher_error_level_not_treated_as_threadname() {
+        // Bitcoin Core LogError() emits [error] as a log level, not a threadname
+        let log = "2025-10-02T02:31:14Z [error] AcceptBlock: bad-witness-nonce-size, CheckWitnessMalleation : invalid witness reserved value size";
+        let log_event = parse_log_event(log);
+
+        assert_eq!(log_event.category, LogDebugCategory::Unknown as i32);
+        assert_eq!(log_event.threadname, "");
+
+        if let Some(LogEvent::UnknownLogMessage(unknown_log)) = log_event.log_event {
+            assert_eq!(
+                unknown_log.raw_message,
+                "AcceptBlock: bad-witness-nonce-size, CheckWitnessMalleation : invalid witness reserved value size"
+            );
+            return;
+        }
+        panic!("Expected UnknownLogMessage event");
+    }
+
+    #[test]
+    fn test_log_matcher_error_level_with_threadname() {
+        // [threadname] [error] message - error should be filtered, threadname preserved
+        let log = "2025-10-02T02:31:14Z [msghand] [error] some error message";
+        let log_event = parse_log_event(log);
+
+        assert_eq!(log_event.threadname, "msghand");
+        assert_eq!(log_event.category, LogDebugCategory::Unknown as i32);
+
+        if let Some(LogEvent::UnknownLogMessage(unknown_log)) = log_event.log_event {
+            assert_eq!(unknown_log.raw_message, "some error message");
+            return;
+        }
+        panic!("Expected UnknownLogMessage event");
+    }
+
+    #[test]
+    fn test_log_matcher_warning_level_filtered() {
+        let log = "2025-10-02T02:31:14Z [warning] some warning message";
+        let log_event = parse_log_event(log);
+
+        assert_eq!(log_event.threadname, "");
+        assert_eq!(log_event.category, LogDebugCategory::Unknown as i32);
+
+        if let Some(LogEvent::UnknownLogMessage(unknown_log)) = log_event.log_event {
+            assert_eq!(unknown_log.raw_message, "some warning message");
+            return;
+        }
+        panic!("Expected UnknownLogMessage event");
+    }
+
+    #[test]
+    fn test_is_standalone_log_level() {
+        assert!(is_standalone_log_level("error"));
+        assert!(is_standalone_log_level("Error"));
+        assert!(is_standalone_log_level("ERROR"));
+        assert!(is_standalone_log_level("warning"));
+        assert!(is_standalone_log_level("Warning"));
+        // info/debug/trace are NOT standalone bracket tokens in Bitcoin Core
+        assert!(!is_standalone_log_level("info"));
+        assert!(!is_standalone_log_level("debug"));
+        assert!(!is_standalone_log_level("trace"));
+        assert!(!is_standalone_log_level("net"));
+        assert!(!is_standalone_log_level("validation"));
+        assert!(!is_standalone_log_level("msghand"));
+        assert!(!is_standalone_log_level("dnsseed"));
     }
 }
