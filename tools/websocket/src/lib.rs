@@ -15,7 +15,7 @@ use shared::{
     tokio::{
         self,
         net::{TcpListener, TcpStream},
-        sync::{watch, Mutex},
+        sync::{oneshot, watch, Mutex},
     },
 };
 use std::collections::HashMap;
@@ -84,12 +84,14 @@ type Clients = Arc<Mutex<HashMap<SocketAddr, Client>>>;
 pub async fn run(
     args: Args,
     mut shutdown_rx: watch::Receiver<bool>,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<(), error::RuntimeError> {
     let nc = nats_util::prepare_connection(&args.nats)?
         .connect(&args.nats.address)
         .await?;
     log::info!("Connected to NATS-server at {}", args.nats.address);
     let mut sub = nc.subscribe("*").await?;
+    nc.flush().await?;
 
     let clients = Arc::new(Mutex::new(HashMap::new()));
 
@@ -114,6 +116,11 @@ pub async fn run(
     let server = TcpListener::bind(args.websocket_address).await?;
     let local_addr = server.local_addr()?;
     log::info!("Started websocket server on {}", local_addr);
+
+    // Notify the caller of the actual bound address (used in tests with port 0).
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(local_addr);
+    }
 
     // Accept WebSocket clients
     loop {

@@ -1,43 +1,35 @@
 #![cfg(feature = "nats_integration_tests")]
 
 use shared::{
-    futures::{stream, SinkExt, StreamExt},
-    log::{self, warn},
+    futures::{SinkExt, StreamExt, stream},
+    log,
     nats_subjects::Subject,
     nats_util::NatsArgs,
     prost::Message,
     protobuf::{
         ebpf_extractor::{
+            Ebpf,
             connection::{self, Connection},
             ebpf,
             mempool::{self, Added},
-            message::{self, message_event::Msg, Metadata, Ping, Pong},
+            message::{self, Metadata, Ping, Pong, message_event::Msg},
             validation::{self, BlockConnected},
-            Ebpf,
         },
-        event::{event::PeerObserverEvent, Event},
+        event::{Event, event::PeerObserverEvent},
     },
-    rand::{self, Rng},
     simple_logger::SimpleLogger,
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{
         self,
-        sync::{watch, Mutex},
+        sync::{oneshot, watch},
         time::{sleep, timeout},
     },
 };
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
-use std::{
-    io::ErrorKind,
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc, Once, OnceLock,
-    },
-    time::Duration,
-};
+use std::{sync::Once, time::Duration};
 
-use websocket::{error::RuntimeError, Args, ClientSubscriptions, ClientSubscriptionsEbpf};
+use websocket::{Args, ClientSubscriptions, ClientSubscriptionsEbpf};
 
 const SUBSCRIBE_NONE: ClientSubscriptions = ClientSubscriptions {
     ebpf: ClientSubscriptionsEbpf {
@@ -74,32 +66,16 @@ struct ClientConfig {
 
 static INIT: Once = Once::new();
 
-static NEXT_WEBSOCKET_PORT: OnceLock<AtomicU16> = OnceLock::new();
-
-fn setup() -> u16 {
+fn setup() {
     INIT.call_once(|| {
         SimpleLogger::new()
             .with_level(log::LevelFilter::Trace)
             .init()
             .unwrap();
-
-        let mut rng = rand::rng();
-
-        // choose start ports from the ephemeral port range
-        let websocket_start = rng.random_range(49152..65500);
-        NEXT_WEBSOCKET_PORT
-            .set(AtomicU16::new(websocket_start))
-            .unwrap();
     });
-
-    let websocket_port = NEXT_WEBSOCKET_PORT
-        .get()
-        .unwrap()
-        .fetch_add(1, Ordering::SeqCst);
-    websocket_port
 }
 
-fn make_test_args(nats_port: u16, websocket_port: u16) -> Args {
+fn make_test_args(nats_port: u16) -> Args {
     Args::new(
         NatsArgs {
             address: format!("127.0.0.1:{}", nats_port),
@@ -107,7 +83,7 @@ fn make_test_args(nats_port: u16, websocket_port: u16) -> Args {
             password: None,
             password_file: None,
         },
-        format!("127.0.0.1:{}", websocket_port),
+        "127.0.0.1:0".to_string(),
         log::Level::Trace,
     )
 }
@@ -131,52 +107,27 @@ async fn publish_and_check_simple(
 }
 
 async fn publish_and_check(events: &[(Subject, Event)], clients: &[ClientConfig]) {
-    let initial_websocket_port = setup();
-    let websocket_port: Arc<Mutex<u16>> = Arc::new(Mutex::new(initial_websocket_port));
+    setup();
 
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let websocket_port_clone = websocket_port.clone();
+    let (bound_addr_tx, bound_addr_rx) = oneshot::channel();
+    let args = make_test_args(nats_server.port);
     let websocket_handle = tokio::spawn(async move {
-        loop {
-            let port: u16;
-            {
-                port = *websocket_port_clone.lock().await;
-            }
-
-            let args = make_test_args(nats_server.port, port);
-            match websocket::run(args, shutdown_rx.clone()).await {
-                Ok(_) => break,
-                Err(e) => match e {
-                    RuntimeError::Io(e) => match e.kind() {
-                        ErrorKind::AddrInUse => {
-                            let new_port = NEXT_WEBSOCKET_PORT
-                                .get()
-                                .unwrap()
-                                .fetch_add(1, Ordering::SeqCst);
-                            warn!(
-                                "Port {} seems to be already in use. Trying port {} next..",
-                                port, new_port
-                            );
-                            let mut port = websocket_port_clone.lock().await;
-                            *port = new_port;
-                        }
-                        _ => panic!("Couldn not start websocket tool: {}", e),
-                    },
-                    _ => panic!("Couldn not start websocket tool: {}", e),
-                },
-            }
-        }
+        websocket::run(args, shutdown_rx, Some(bound_addr_tx))
+            .await
+            .expect("websocket tool should start successfully");
     });
-    // allow the websocket tool to start
-    sleep(Duration::from_secs(1)).await;
 
-    let port = websocket_port.lock().await;
+    let bound_addr = bound_addr_rx
+        .await
+        .expect("Should receive bound address from websocket tool");
+
     let mut clients_stream = vec![];
     for client_config in clients {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
+        let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://{}", bound_addr))
             .await
             .expect("Should be able to connect to websocket");
         let (mut outgoing, incoming) = ws_stream.split();
@@ -242,50 +193,24 @@ async fn publish_and_check(events: &[(Subject, Event)], clients: &[ClientConfig]
 }
 
 async fn custom_message_check(message: &str) {
-    let initial_websocket_port = setup();
-    let websocket_port: Arc<Mutex<u16>> = Arc::new(Mutex::new(initial_websocket_port));
+    setup();
 
     let nats_server = NatsServerForTesting::new(&[]).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let websocket_port_clone = websocket_port.clone();
+    let (bound_addr_tx, bound_addr_rx) = oneshot::channel();
+    let args = make_test_args(nats_server.port);
     let websocket_handle = tokio::spawn(async move {
-        loop {
-            let port: u16;
-            {
-                port = *websocket_port_clone.lock().await;
-            }
-
-            let args = make_test_args(nats_server.port, port);
-            match websocket::run(args, shutdown_rx.clone()).await {
-                Ok(_) => break,
-                Err(e) => match e {
-                    RuntimeError::Io(e) => match e.kind() {
-                        ErrorKind::AddrInUse => {
-                            let new_port = NEXT_WEBSOCKET_PORT
-                                .get()
-                                .unwrap()
-                                .fetch_add(1, Ordering::SeqCst);
-                            warn!(
-                                "Port {} seems to be already in use. Trying port {} next..",
-                                port, new_port
-                            );
-                            let mut port = websocket_port_clone.lock().await;
-                            *port = new_port;
-                        }
-                        _ => panic!("Couldn not start websocket tool: {}", e),
-                    },
-                    _ => panic!("Couldn not start websocket tool: {}", e),
-                },
-            }
-        }
+        websocket::run(args, shutdown_rx, Some(bound_addr_tx))
+            .await
+            .expect("websocket tool should start successfully");
     });
-    // allow the websocket tool to start
-    sleep(Duration::from_secs(1)).await;
 
-    let port = websocket_port.lock().await;
+    let bound_addr = bound_addr_rx
+        .await
+        .expect("Should receive bound address from websocket tool");
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", port))
+    let (ws_stream, _) = tokio_tungstenite::connect_async(format!("ws://{}", bound_addr))
         .await
         .expect("Should be able to connect to websocket");
     let (mut outgoing, mut incoming) = ws_stream.split();

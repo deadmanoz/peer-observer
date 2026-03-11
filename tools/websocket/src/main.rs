@@ -12,7 +12,9 @@ async fn main() {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let websocket_handle = tokio::spawn(websocket::run(args, shutdown_rx));
+    // No bound address notification needed in production (used in tests to
+    // communicate the OS-assigned port back when binding to port 0).
+    let websocket_handle = tokio::spawn(websocket::run(args, shutdown_rx, None));
 
     tokio::select! {
         _ = signal::ctrl_c() => {
