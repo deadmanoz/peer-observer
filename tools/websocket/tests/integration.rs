@@ -1,26 +1,26 @@
 #![cfg(feature = "nats_integration_tests")]
 
 use shared::{
-    futures::{SinkExt, StreamExt, stream},
+    futures::{stream, SinkExt, StreamExt},
     log,
     nats_subjects::Subject,
     nats_util::NatsArgs,
     prost::Message,
     protobuf::{
         ebpf_extractor::{
-            Ebpf,
             connection::{self, Connection},
             ebpf,
             mempool::{self, Added},
-            message::{self, Metadata, Ping, Pong, message_event::Msg},
+            message::{self, message_event::Msg, Metadata, Ping, Pong},
             validation::{self, BlockConnected},
+            Ebpf,
         },
-        event::{Event, event::PeerObserverEvent},
+        event::{event::PeerObserverEvent, Event},
     },
     simple_logger::SimpleLogger,
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{
-        self,
+        self, select,
         sync::{oneshot, watch},
         time::{sleep, timeout},
     },
@@ -88,6 +88,122 @@ fn make_test_args(nats_port: u16) -> Args {
     )
 }
 
+/// Creates a marker event matching the first active subscription type in the
+/// given subscriptions. Returns `(subject, payload, detect)` where `detect` is
+/// a substring that uniquely identifies this marker in the JSON-serialized
+/// websocket message. Returns `None` if no subscriptions are active.
+/// Only covers types exercised by tests: messages and mempool.
+fn marker_for_subscriptions(
+    marker: &str,
+    client_index: usize,
+    subs: &ClientSubscriptions,
+) -> Option<(String, Vec<u8>, String)> {
+    let (subject, ebpf_event, detect) = if subs.ebpf.messages {
+        (
+            Subject::NetMsg,
+            ebpf::EbpfEvent::Message(message::MessageEvent {
+                meta: Metadata {
+                    peer_id: 0,
+                    addr: marker.to_string(),
+                    conn_type: 0,
+                    command: "marker".to_string(),
+                    inbound: false,
+                    size: 0,
+                },
+                msg: Some(Msg::Ping(Ping { value: 0 })),
+            }),
+            marker.to_string(),
+        )
+    } else if subs.ebpf.mempool {
+        // Mempool events have no string fields, so we use a unique fee value
+        // derived from the client index as the detection substring.
+        let fee: i64 = 21212121 + client_index as i64;
+        (
+            Subject::Mempool,
+            ebpf::EbpfEvent::Mempool(mempool::MempoolEvent {
+                event: Some(mempool::mempool_event::Event::Added(Added {
+                    txid: vec![],
+                    vsize: 0,
+                    fee,
+                })),
+            }),
+            fee.to_string(),
+        )
+    } else {
+        return None;
+    };
+
+    let event = Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+        ebpf_event: Some(ebpf_event),
+    }))
+    .unwrap();
+
+    Some((subject.to_string(), event.encode_to_vec(), detect))
+}
+
+/// Publishes a marker event to NATS and waits for it to arrive on the given
+/// websocket client stream, proving the full NATS -> server -> client path is
+/// live. The marker is re-published on a short interval because early
+/// publications may arrive before the server has fully registered the client.
+/// Panics on timeout.
+async fn wait_for_marker<S>(
+    publisher: &NatsPublisherForTesting,
+    marker: &str,
+    subject: &str,
+    payload: &[u8],
+    detect: &str,
+    client: &mut S,
+) where
+    S: StreamExt<Item = Result<TungsteniteMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut marker_seen = false;
+    select! {
+        _ = sleep(Duration::from_secs(5)) => {
+            panic!("timed out waiting for pipeline-ready marker '{marker}'");
+        }
+        _ = async {
+            loop {
+                publisher
+                    .publish(subject.to_string(), payload.to_vec())
+                    .await;
+                log::debug!("published pipeline-ready marker '{marker}'");
+
+                // Drain all available messages before re-publishing. Earlier
+                // clients' markers may have accumulated in this stream.
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(50), client.next()).await {
+                        Ok(Some(msg)) => {
+                            let msg = msg.expect("websocket message should be valid");
+                            if msg.to_string().contains(detect) {
+                                log::info!("received pipeline-ready marker: {marker}");
+                                marker_seen = true;
+                                return;
+                            }
+                            // Not our marker; keep draining.
+                        }
+                        Ok(None) => panic!(
+                            "websocket stream closed before pipeline-ready marker '{marker}' arrived"
+                        ),
+                        Err(_) => break, // no more messages, re-publish
+                    }
+                }
+            }
+        } => {}
+    }
+    assert!(
+        marker_seen,
+        "websocket stream closed before pipeline-ready marker '{marker}' arrived"
+    );
+
+    // Drain any extra copies of the marker that arrived while re-publishing.
+    // No real test events have been published yet, so everything here is a
+    // marker (ours or another client's from a prior iteration).
+    sleep(Duration::from_millis(50)).await;
+    while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(10), client.next()).await {
+        let _ = msg.expect("websocket message should be valid");
+    }
+}
+
 async fn publish_and_check_simple(
     events: &[(Subject, Event)],
     expected_events: Vec<&'static str>,
@@ -140,6 +256,53 @@ async fn publish_and_check(events: &[(Subject, Event)], clients: &[ClientConfig]
             .await
             .expect("Should be able to send subscription message");
         clients_stream.push((outgoing, incoming));
+    }
+
+    // Pipeline readiness barrier: wait for EVERY subscribing client to
+    // confirm the full NATS -> websocket server -> client path is live.
+    // Each client is independently inserted into the server's broadcast map
+    // and has its subscriptions applied independently, so one
+    // client receiving a marker does NOT prove the others are registered.
+    // The marker event type must match the client's subscription because
+    // broadcast_to_clients() filters by protobuf variant.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+
+    for (i, client_config) in clients.iter().enumerate() {
+        if client_config.disconnect {
+            continue;
+        }
+        let marker = format!("PIPELINE_READY:{nanos}:{i}");
+        if let Some((subject, payload, detect)) =
+            marker_for_subscriptions(&marker, i, &client_config.subscriptions)
+        {
+            wait_for_marker(
+                &nats_publisher,
+                &marker,
+                &subject,
+                &payload,
+                &detect,
+                &mut clients_stream[i].1,
+            )
+            .await;
+        }
+    }
+
+    // Final drain: flush any markers that leaked to other clients during
+    // the sequential readiness checks above.
+    sleep(Duration::from_millis(50)).await;
+    for (i, client_config) in clients.iter().enumerate() {
+        if client_config.disconnect {
+            continue;
+        }
+        let incoming = &mut clients_stream[i].1;
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(Duration::from_millis(10), incoming.next()).await
+        {
+            let _ = msg.expect("websocket message should be valid");
+        }
     }
 
     for (subject, event) in events.iter() {
