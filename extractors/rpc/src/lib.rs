@@ -10,9 +10,10 @@ use shared::nats_util::{self, NatsArgs};
 use shared::prost::Message;
 use shared::protobuf::event::{Event, event::PeerObserverEvent};
 use shared::protobuf::rpc_extractor::{self, EstimateSmartFee};
-use shared::tokio::sync::watch;
+use shared::tokio::sync::{oneshot, watch};
 use shared::tokio::time::{self, Duration};
 use shared::{async_nats, clap};
+use std::net::SocketAddr;
 
 mod error;
 pub mod metrics;
@@ -172,12 +173,13 @@ impl Args {
     }
 }
 
-pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), RuntimeError> {
+pub async fn run(
+    args: Args,
+    mut shutdown_rx: watch::Receiver<bool>,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+) -> Result<(), RuntimeError> {
     // Create metrics instance with its own registry
     let metrics = Metrics::new();
-
-    // Start the metric server with our custom registry.
-    shared::metricserver::start(&args.prometheus_address, Some(metrics.registry.clone()))?;
 
     let auth: Auth = match args.rpc_cookie_file {
         Some(path) => Auth::CookieFile(path.into()),
@@ -192,6 +194,19 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         .connect(&args.nats.address)
         .await?;
     log::info!("Connected to NATS server at {}", &args.nats.address);
+
+    // Start the metric server with our custom registry. This happens after
+    // the RPC client and NATS connection are set up so that any startup
+    // failure surfaces through the readiness barrier in tests (which races
+    // bound_addr_tx against the extractor task handle) instead of leaving
+    // the test to time out. Matches the order used in p2p_extractor::run.
+    let local_addr =
+        shared::metricserver::start(&args.prometheus_address, Some(metrics.registry.clone()))?;
+
+    // Notify the caller of the actual bound address (used in tests with port 0).
+    if let Some(tx) = bound_addr_tx {
+        let _ = tx.send(local_addr);
+    }
 
     let duration_sec = Duration::from_secs(args.query_interval);
     let mut interval = time::interval(duration_sec);
