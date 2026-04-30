@@ -13,4 +13,5 @@ members = [
   "tools/connectivity-check",
   "tools/archiver",
   "tools/replayer",
+  "tools/alerts",
 ]

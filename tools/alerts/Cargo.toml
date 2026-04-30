@@ -1,0 +1,13 @@
+[package]
+name = "alerts"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[features]
+# Treat warnings as a build error.
+strict = []
+# Run integration tests needing a NATS server.
+nats_integration_tests = []
