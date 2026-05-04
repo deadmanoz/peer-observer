@@ -1,10 +1,9 @@
 #![cfg(feature = "nats_integration_tests")]
 
-use metrics::error::RuntimeError;
 use metrics::Args;
 
 use shared::{
-    log::{debug, warn, Level, LevelFilter},
+    log::{debug, Level, LevelFilter},
     nats_subjects::Subject,
     nats_util::NatsArgs,
     prost::Message,
@@ -35,58 +34,34 @@ use shared::{
             PeerInfos, UploadTarget,
         },
     },
-    rand::{self, RngExt},
     simple_logger::SimpleLogger,
     testing::{
         metrics_fetcher::fetch_metrics_root, nats_publisher::NatsPublisherForTesting,
         nats_server::NatsServerForTesting,
     },
     tokio::{
-        self,
-        sync::{watch, Mutex},
+        self, select,
+        sync::{oneshot, watch},
+        task::JoinHandle,
         time::sleep,
     },
     util::current_timestamp,
 };
 
-use std::{
-    collections::HashMap,
-    io::ErrorKind,
-    sync::{
-        atomic::{AtomicU16, Ordering},
-        Arc, Once, OnceLock,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Once, time::Duration};
 
 static INIT: Once = Once::new();
-static NEXT_METRICS_PORT: OnceLock<AtomicU16> = OnceLock::new();
 
-fn setup() -> u16 {
+fn setup() {
     INIT.call_once(|| {
         SimpleLogger::new()
             .with_level(LevelFilter::Trace)
             .init()
             .unwrap();
-
-        let mut rng = rand::rng();
-
-        // choose start ports from the ephemeral port range
-        let metrics_start = rng.random_range(49152..65500);
-
-        NEXT_METRICS_PORT
-            .set(AtomicU16::new(metrics_start))
-            .unwrap();
     });
-
-    let metrics_port = NEXT_METRICS_PORT
-        .get()
-        .unwrap()
-        .fetch_add(1, Ordering::SeqCst);
-    metrics_port
 }
 
-fn make_test_args(nats_port: u16, metrics_port: u16) -> Args {
+fn make_test_args(nats_port: u16) -> Args {
     Args {
         nats: NatsArgs {
             address: format!("127.0.0.1:{}", nats_port),
@@ -94,82 +69,139 @@ fn make_test_args(nats_port: u16, metrics_port: u16) -> Args {
             password: None,
             password_file: None,
         },
-        metrics_address: format!("127.0.0.1:{}", metrics_port),
+        metrics_address: "127.0.0.1:0".to_string(),
         log_level: Level::Trace,
     }
 }
 
-fn check_metrics(port: u16, expected: &[&str]) -> Result<bool, std::io::Error> {
-    let metrics_raw = fetch_metrics_root(port)?;
-
-    println!("HTTP response from metrics server:\n");
-    for line in metrics_raw.split("\n") {
-        println!("{}", line);
-    }
-
-    println!("Only metrics (no help text):\n");
-    for line in metrics_raw.split("\n") {
-        if !line.starts_with("# ") {
-            println!("{}", line);
-        }
-    }
-
-    let mut no_lines_missing = true;
-    for line in expected {
+fn all_lines_present(metrics_raw: &str, expected_lines: &[&str]) -> bool {
+    for line in expected_lines {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         if !metrics_raw.contains(line) {
-            println!("Response does not contain line: '{}'", line);
-            no_lines_missing = false;
+            return false;
         }
     }
-    Ok(no_lines_missing)
+    true
+}
+
+fn print_metrics_failure(metrics_raw: &str, expected_lines: &[&str]) {
+    println!("HTTP response from metrics server:\n");
+    for line in metrics_raw.split("\n") {
+        println!("{}", line);
+    }
+
+    println!("Missing expected lines:");
+    for line in expected_lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !metrics_raw.contains(line) {
+            println!("  - '{}'", line);
+        }
+    }
+}
+
+/// Pipeline readiness barrier for the metrics tool's NATS subscription.
+///
+/// Receiving the metrics server's bound address only proves the HTTP endpoint
+/// is listening; it does not guarantee the NATS server has processed the
+/// metrics tool's subscription ahead of our publisher on a separate connection.
+///
+/// We publish a marker `Uptime` event in a retry loop until its effect is
+/// visible in the Prometheus output, proving the SUB->PUB path is live
+/// end-to-end. The marker value is far beyond any plausible real uptime
+/// so it is unambiguous, and all real per-test events that touch
+/// `peerobserver_rpc_uptime` re-set it via the same gauge.
+///
+/// The retry loop is raced against the metrics task handle so that if the
+/// task exits after binding but before consuming the marker (e.g. NATS
+/// disconnect, internal panic), we surface the underlying error rather
+/// than panic with a generic "marker not visible" message.
+async fn wait_for_metrics_ready(
+    publisher: &NatsPublisherForTesting,
+    metrics_port: u16,
+    metrics_handle: &mut JoinHandle<()>,
+) {
+    // u32::MAX is far beyond any plausible Bitcoin Core uptime (~136 years)
+    // and any per-test value used in `test_integration_metrics_rpc_uptime`.
+    const MARKER_UPTIME: u32 = u32::MAX;
+    let marker_event = Event::new(PeerObserverEvent::RpcExtractor(rpc_extractor::Rpc {
+        rpc_event: Some(rpc_extractor::rpc::RpcEvent::Uptime(MARKER_UPTIME)),
+    }))
+    .unwrap();
+    let expected = format!("peerobserver_rpc_uptime {MARKER_UPTIME}");
+
+    select! {
+        _ = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                publisher
+                    .publish(Subject::Rpc.to_string(), marker_event.encode_to_vec())
+                    .await;
+
+                // Brief inner wait while the server routes the publish and the
+                // tool processes it, then check the Prometheus output.
+                let inner_deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+                loop {
+                    if let Ok(metrics_raw) = fetch_metrics_root(metrics_port) {
+                        if metrics_raw.contains(&expected) {
+                            return;
+                        }
+                    }
+                    if tokio::time::Instant::now() >= inner_deadline {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "metrics tool did not become ready: pipeline-ready marker uptime {MARKER_UPTIME} not visible after 5s"
+                    );
+                }
+            }
+        } => {}
+        result = metrics_handle => {
+            result.unwrap();
+            unreachable!("metrics task exited before pipeline-ready marker became visible");
+        }
+    }
 }
 
 async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
-    let initial_metrics_port = setup();
-    let metrics_port: Arc<Mutex<u16>> = Arc::new(Mutex::new(initial_metrics_port));
+    setup();
 
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let metrics_port_clone = metrics_port.clone();
-    let metrics_handle = tokio::spawn(async move {
-        loop {
-            let port: u16;
-            {
-                port = *metrics_port_clone.lock().await;
-            }
-
-            let args = make_test_args(nats_server.port, port);
-            match metrics::run(args, shutdown_rx.clone()).await {
-                Ok(_) => break,
-                Err(e) => match e {
-                    RuntimeError::Io(e) => match e.kind() {
-                        ErrorKind::AddrInUse => {
-                            let new_port = NEXT_METRICS_PORT
-                                .get()
-                                .unwrap()
-                                .fetch_add(1, Ordering::SeqCst);
-                            warn!(
-                                "Port {} seems to be already in use. Trying port {} next..",
-                                port, new_port
-                            );
-                            let mut port = metrics_port_clone.lock().await;
-                            *port = new_port;
-                        }
-                        _ => panic!("Couldn not start metrics tool: {}", e),
-                    },
-                    _ => panic!("Couldn not start metrics tool: {}", e),
-                },
-            }
-        }
+    let (addr_tx, addr_rx) = oneshot::channel();
+    let mut metrics_handle = tokio::spawn(async move {
+        let args = make_test_args(nats_server.port);
+        metrics::run(args, shutdown_rx.clone(), Some(addr_tx))
+            .await
+            .expect("Could not start metrics tool");
     });
-    // allow the metrics tool to start
-    sleep(Duration::from_secs(1)).await;
+
+    // Wait for the metrics tool to bind and report its actual port.
+    // We race against the task handle so that if the metrics tool fails
+    // before binding (e.g. NATS connection error), we surface the
+    // real error instead of a generic "channel closed" panic.
+    let metrics_port = select! {
+        addr = addr_rx => addr.expect("metrics tool should send bound address").port(),
+        result = &mut metrics_handle => {
+            result.unwrap();
+            unreachable!("metrics task exited before sending bound address");
+        }
+    };
+
+    // End-to-end readiness barrier: prove the metrics tool's SUB has been
+    // processed by the server before we publish the real test events.
+    wait_for_metrics_ready(&nats_publisher, metrics_port, &mut metrics_handle).await;
 
     for event in events {
         debug!("publishing: {:?}", event);
@@ -178,11 +210,22 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
             .await;
     }
 
-    sleep(Duration::from_millis(100)).await;
-
     let expected_lines: Vec<&str> = expected.split('\n').collect();
-    let port = metrics_port.lock().await;
-    assert!(check_metrics(*port, &expected_lines).expect("Could not fetch metrics"));
+
+    // Poll the metrics endpoint until all expected lines appear or we time out.
+    // Avoid printing on every iteration; only dump the response on final failure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let metrics_raw = fetch_metrics_root(metrics_port).expect("Could not fetch metrics");
+        if all_lines_present(&metrics_raw, &expected_lines) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            print_metrics_failure(&metrics_raw, &expected_lines);
+            panic!("Timed out waiting for expected metrics");
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 
     shutdown_tx.send(true).unwrap();
     metrics_handle.await.unwrap();
@@ -191,11 +234,11 @@ async fn publish_and_check(events: &[Event], subject: Subject, expected: &str) {
 #[tokio::test]
 async fn test_integration_metrics_no_nats_connection() {
     println!("test that we fail if we can't connect to NATS (due to port 0)");
-    let _ = setup();
+    setup();
 
-    let args = make_test_args(0, 0);
+    let args = make_test_args(0);
     let (_, shutdown_rx) = watch::channel(false);
-    let result = metrics::run(args, shutdown_rx).await;
+    let result = metrics::run(args, shutdown_rx, None).await;
 
     assert!(result.is_err());
     // allows for easier debugging if it's not a Io error..
