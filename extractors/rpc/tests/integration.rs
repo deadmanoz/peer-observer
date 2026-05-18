@@ -3,9 +3,7 @@
 
 mod common;
 
-use common::{
-    EnabledRPCsInTest, get_available_port, make_test_args, setup, setup_two_connected_nodes,
-};
+use common::{EnabledRPCsInTest, make_test_args, setup, setup_two_connected_nodes};
 
 use shared::{
     async_nats,
@@ -29,7 +27,7 @@ use shared::{
     testing::{REGTEST_ADDRESS, nats_server::NatsServerForTesting},
     tokio::{
         self, select,
-        sync::watch,
+        sync::{oneshot, watch},
         time::{Duration, sleep},
     },
 };
@@ -48,7 +46,7 @@ async fn check(
     let (node1, node2) = setup_two_connected_nodes();
     let nats_server = NatsServerForTesting::new(&[]).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let metrics_port = get_available_port();
+    let (addr_tx, addr_rx) = oneshot::channel();
 
     let url = node1.rpc_url().replace("http://", "");
     let cookie_file_path = node1.params.cookie_file.display().to_string();
@@ -57,18 +55,26 @@ async fn check(
     test_setup(&node1, &node2);
     sleep(Duration::from_secs(1)).await;
 
-    let rpc_extractor_handle = tokio::spawn(async move {
-        let args = make_test_args(
-            nats_server.port,
-            url,
-            cookie_file_path,
-            format!("127.0.0.1:{}", metrics_port),
-            rpcs,
-        );
-        rpc_extractor::run(args, shutdown_rx.clone())
+    let mut rpc_extractor_handle = tokio::spawn(async move {
+        let args = make_test_args(nats_server.port, url, cookie_file_path, rpcs);
+        rpc_extractor::run(args, shutdown_rx.clone(), Some(addr_tx))
             .await
             .expect("rpc extractor failed");
     });
+
+    // Wait for the rpc-extractor to bind its Prometheus port and report
+    // the OS-assigned address back. Race against the task handle so that
+    // if the extractor fails before binding (e.g. NATS connection error),
+    // we surface the real error instead of a generic "channel closed" panic.
+    select! {
+        addr = addr_rx => {
+            addr.expect("rpc-extractor should send bound address");
+        }
+        result = &mut rpc_extractor_handle => {
+            result.unwrap();
+            unreachable!("rpc-extractor task exited before sending bound address");
+        }
+    }
 
     let nc = async_nats::connect(format!("127.0.0.1:{}", nats_server.port))
         .await

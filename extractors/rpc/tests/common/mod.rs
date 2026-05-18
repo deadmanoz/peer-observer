@@ -5,19 +5,9 @@ use shared::{
     simple_logger::SimpleLogger,
 };
 
-use std::net::TcpListener;
 use std::sync::Once;
 
 use rpc_extractor::Args;
-
-/// Get an available port for the metrics server.
-pub fn get_available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("Failed to bind to port 0")
-        .local_addr()
-        .expect("Failed to get local addr")
-        .port()
-}
 
 static INIT: Once = Once::new();
 
@@ -117,7 +107,6 @@ pub fn make_test_args(
     nats_port: u16,
     rpc_url: String,
     cookie_file: String,
-    prometheus_address: String,
     rpcs: EnabledRPCsInTest,
 ) -> Args {
     Args::new(
@@ -132,7 +121,7 @@ pub fn make_test_args(
         cookie_file,
         QUERY_INTERVAL_SECONDS,
         QUERY_INTERVAL_SECONDS, // query_interval_less_frequent, but don't fetch less frequently in tests
-        prometheus_address,
+        "127.0.0.1:0".to_string(),
         !rpcs.getpeerinfo,
         !rpcs.getmempoolinfo,
         !rpcs.uptime,
