@@ -92,6 +92,49 @@ jobs:
 
   # Ubuntu jobs
 
+  ubuntu-cache-seed:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install build dependecies
+      run: |
+        sudo apt update -y
+        sudo apt-get install -y \
+          protobuf-compiler \
+          libelf-dev \
+          clang \
+          llvm \
+          llvm-14 \
+          zstd \
+          binutils-dev \
+          elfutils \
+          gcc-multilib \
+          libcapnp-dev \
+          capnproto
+    - name: Cache cargo seed
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-ubuntu-cargo-seed-v1-${{ hashFiles('**/Cargo.lock') }}
+    - name: Report disk usage after seed cache restore
+      run: |
+        df -h /
+        du -sh ~/.cargo/registry ~/.cargo/git target || true
+        du -sh target/debug/deps target/debug/incremental target/debug/build || true
+    - name: Install integration test dependecies
+      run: sudo apt-get install -y nats-server
+    - name: Run all-features tests to populate seed cache
+      run: NATS_SERVER_BINARY=$(which nats-server) cargo test --all-features
+    - name: Report disk usage after seed test run
+      run: |
+        df -h /
+        du -sh ~/.cargo/registry ~/.cargo/git target || true
+        du -sh target/debug/deps target/debug/incremental target/debug/build || true
+
   ubuntu-build:
     runs-on: ubuntu-latest
     steps:
