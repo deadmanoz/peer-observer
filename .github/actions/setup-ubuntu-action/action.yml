@@ -31,3 +31,10 @@ runs:
         key: ${{ runner.os }}-ubuntu-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-ubuntu-cargo-
+
+    - name: Report disk usage after cargo cache restore
+      shell: bash
+      run: |
+        df -h /
+        du -sh ~/.cargo/registry ~/.cargo/git target || true
+        du -sh target/debug/deps target/debug/incremental target/debug/build || true
