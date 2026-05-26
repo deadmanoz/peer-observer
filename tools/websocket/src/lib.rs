@@ -91,7 +91,6 @@ pub async fn run(
         .await?;
     log::info!("Connected to NATS-server at {}", args.nats.address);
     let mut sub = nc.subscribe("*").await?;
-    nc.flush().await?;
 
     let clients = Arc::new(Mutex::new(HashMap::new()));
 

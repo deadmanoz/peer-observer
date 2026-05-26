@@ -1,5 +1,4 @@
 use shared::async_nats;
-use shared::async_nats::client::FlushErrorKind;
 use shared::async_nats::ConnectErrorKind;
 use shared::log::SetLoggerError;
 use shared::prost::DecodeError;
@@ -14,7 +13,6 @@ pub enum RuntimeError {
     ProtobufDecode(DecodeError),
     NatsSubscribe(async_nats::client::SubscribeError),
     NatsConnect(shared::async_nats::error::Error<ConnectErrorKind>),
-    NatsFlush(shared::async_nats::error::Error<FlushErrorKind>),
 }
 
 impl fmt::Display for RuntimeError {
@@ -25,7 +23,6 @@ impl fmt::Display for RuntimeError {
             RuntimeError::ProtobufDecode(e) => write!(f, "protobuf decode error {}", e),
             RuntimeError::NatsSubscribe(e) => write!(f, "NATS subscribe error {}", e),
             RuntimeError::NatsConnect(e) => write!(f, "NATS connection error {}", e),
-            RuntimeError::NatsFlush(e) => write!(f, "NATS flush error {}", e),
         }
     }
 }
@@ -38,7 +35,6 @@ impl error::Error for RuntimeError {
             RuntimeError::ProtobufDecode(ref e) => Some(e),
             RuntimeError::NatsSubscribe(ref e) => Some(e),
             RuntimeError::NatsConnect(ref e) => Some(e),
-            RuntimeError::NatsFlush(ref e) => Some(e),
         }
     }
 }
@@ -70,11 +66,5 @@ impl From<async_nats::client::SubscribeError> for RuntimeError {
 impl From<shared::async_nats::error::Error<ConnectErrorKind>> for RuntimeError {
     fn from(e: shared::async_nats::error::Error<ConnectErrorKind>) -> Self {
         RuntimeError::NatsConnect(e)
-    }
-}
-
-impl From<shared::async_nats::error::Error<FlushErrorKind>> for RuntimeError {
-    fn from(e: shared::async_nats::error::Error<FlushErrorKind>) -> Self {
-        RuntimeError::NatsFlush(e)
     }
 }
