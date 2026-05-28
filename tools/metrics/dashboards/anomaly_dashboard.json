@@ -1312,21 +1312,22 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "text": "my_host",
-          "value": "my_host"
+        "datasource": {
+          "type": "prometheus",
+          "uid": "P1809F7CD0C75ACF3"
         },
-        "description": "",
+        "definition": "label_values(host)",
+        "includeAll": false,
+        "multi": false,
         "name": "HOST",
-        "options": [
-          {
-            "selected": true,
-            "text": "my_host",
-            "value": "my_host"
-          }
-        ],
-        "query": "my_host",
-        "type": "textbox"
+        "options": [],
+        "query": {
+          "query": "label_values(host)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "type": "query"
       }
     ]
   },
