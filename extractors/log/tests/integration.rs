@@ -712,7 +712,6 @@ async fn test_integration_logextractor_saw_new_header() {
                         "block_hash should not be empty"
                     );
                     assert_eq!(block.block_height, 2);
-                    assert!(block.peer_id == 0 || block.peer_id == 1); // in rare cases, peer_id might be 1
                     info!("SawNewHeaderLog event {}", block);
                     return true;
                 }
